@@ -20,7 +20,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var version = "1.1.0"
+var version = "1.2.0"
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`

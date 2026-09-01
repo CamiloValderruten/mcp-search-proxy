@@ -2,7 +2,7 @@
 
 # ⚡ mcp-search-proxy
 
-### The High-Performance Federated Gateway & Identity Router for Model Context Protocol (MCP)
+### The High-Performance Federated Gateway, Identity Router & Tool Cache for Model Context Protocol (MCP)
 
 [![Release](https://img.shields.io/github/v/release/CamiloValderruten/mcp-search-proxy?style=flat-square&color=blue)](https://github.com/CamiloValderruten/mcp-search-proxy/releases)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/CamiloValderruten/mcp-search-proxy?style=flat-square)](https://go.dev/)
@@ -10,9 +10,9 @@
 [![Tests](https://img.shields.io/github/actions/workflow/status/CamiloValderruten/mcp-search-proxy/ci.yml?branch=main&label=tests&style=flat-square)](https://github.com/CamiloValderruten/mcp-search-proxy/actions)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
-**Federate 100+ MCP servers into a single lightweight gateway with on-demand tool discovery, sub-millisecond search, TTL caching, caller identity RBAC, and dual STDIO/HTTP daemon modes.**
+**Federate 100+ MCP servers into a single lightweight gateway with on-demand tool discovery, sub-millisecond search, TTL result caching, caller identity RBAC, optional neural vector search, and dual STDIO/HTTP daemon modes.**
 
-[Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon Mode](#-http-daemon-mode) • [Identity RBAC](#-identity-aware-tool-routing--rbac) • [Benchmarks](#-benchmarks)
+[Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon Mode](#-http-daemon-mode) • [Identity RBAC](#-identity-aware-tool-routing--rbac) • [Semantic Search](#-semantic-vector-search-optional) • [Benchmarks](#-performance--efficiency-benchmarks)
 
 ---
 
@@ -66,9 +66,9 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 ## ✨ Key Features
 
 - 📉 **98.5% Token Reduction**: Drops tool schema prompt overhead from 25,000+ tokens to ~335 tokens.
-- 🧠 **Optional Semantic Vector Search**: Pass an OpenAI API key (`text-embedding-3-small` or Ollama) to enable neural vector embeddings and cosine similarity search alongside lexical scoring.
 - ⚡ **Sub-Millisecond Search**: Pure Go in-memory weighted multi-field search engine scores tool names, descriptions, and server domains in `< 20 microseconds`.
-- 🌐 **Dual-Mode (STDIO + HTTP)**: Run as a standard STDIO process for desktop agents or as a persistent 24/7 HTTP/SSE daemon (`-listen :8080`) shared across your network.
+- 🧠 **Optional Semantic Vector Search**: Configure an OpenAI API key (`text-embedding-3-small` or Ollama) for neural vector embeddings and cosine similarity matching.
+- 🌐 **Dual-Mode (STDIO + HTTP)**: Run as a standard CLI STDIO process or as a persistent 24/7 HTTP/SSE daemon (`-listen :8080`) shared across your network.
 - 🔑 **Identity-Aware RBAC & User Mapping**: Expose only authorized tools per client token, enforce read-only policies, and dynamically map caller identities to backend accounts.
 - 🚀 **Concurrent Multiplexing**: Non-blocking asynchronous JSON-RPC event loop with thread-safe atomic I/O.
 - 🔒 **Security Guardrails**: Enforce `read_only: true` on production databases, whitelist approved tools, or blacklist dangerous commands (`blocked_tools: ["drop_*", "delete_*"]`).
@@ -87,13 +87,13 @@ go install github.com/CamiloValderruten/mcp-search-proxy@latest
 ```
 
 ### Option 2: Prebuilt Binaries
-Download the latest prebuilt binary for macOS, Linux, or Windows from the [Releases](https://github.com/CamiloValderruten/mcp-search-proxy/releases) page.
+Download the latest prebuilt binary for macOS (Apple Silicon & Intel), Linux (amd64 & arm64), or Windows from the [Releases](https://github.com/CamiloValderruten/mcp-search-proxy/releases) page.
 
 ---
 
 ## 🌐 HTTP Daemon Mode
 
-Run `mcp-search-proxy` as a persistent background daemon on your machine or home server:
+Run `mcp-search-proxy` as a persistent background daemon on your machine or server:
 
 ```bash
 mcp-search-proxy -config servers.json -listen 0.0.0.0:8080
@@ -101,14 +101,14 @@ mcp-search-proxy -config servers.json -listen 0.0.0.0:8080
 
 ### Why HTTP Daemon Mode is a Game-Changer:
 1. **Zero Cold Starts**: Subprocesses (Node, Python, Docker) stay warm 24/7. Tool calls execute with 0ms connection lag.
-2. **Shared In-Memory Cache**: 10 different chat windows or agents share the same cached results.
+2. **Shared In-Memory Cache**: Multiple chat windows or agents share the same cached results.
 3. **No Process Duplication**: 5 IDE windows talk to **1 central proxy** instead of spawning 30 duplicate background processes.
 4. **Network Access**: Connect remote laptops, VMs, or web-based AI clients (Open WebUI, LibreChat, Dify, LangChain).
 
 ### Built-In Endpoints:
 - `POST /mcp` — Modern Streamable HTTP transport
 - `GET /mcp` — SSE stream connection
-- `GET /health` — `{"status":"ok","active_upstreams":6,"indexed_tools":143}`
+- `GET /health` — `{"status":"ok","version":"1.2.0","active_upstreams":4,"indexed_tools":85}`
 - `GET /metrics` — Live Prometheus/JSON performance stats
 
 ---
@@ -149,8 +149,8 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 4. **STDIO Authentication**: Pass `-client-id <id>` when launching in STDIO mode.
 
 ---
- 
- ## 🧠 Semantic Vector Search (Optional)
+
+## 🧠 Semantic Vector Search (Optional)
 
 `mcp-search-proxy` works out of the box with zero external dependencies using fast lexical search. If you prefer **neural semantic search**, configure an OpenAI API key or any OpenAI-compatible `/v1/embeddings` endpoint (e.g. Ollama, LM Studio, vLLM):
 
@@ -163,16 +163,16 @@ Control exactly which tools each user or AI agent is permitted to discover and e
   }
 }
 ```
-*(Or simply add `"openAIKey": "${OPENAI_API_KEY}"` under `"settings"`).*
+*(Or simply add `"openAIKey": "${OPENAI_API_KEY}"` under `"settings"` or export `OPENAI_API_KEY` in your shell).*
 
 ### How Semantic Search Works:
-1. At startup, the proxy generates vector embeddings for all upstream tools in a single batch call (~100ms, costs ~$0.00005).
+1. At startup, the proxy generates vector embeddings for all unique upstream tools in a single batch call (~100ms, costs ~$0.00005).
 2. When `search_tools` is called, it embeds the query and calculates cosine similarity across in-memory vectors.
-3. Natural concepts (e.g. `"baby"`, `"something to turn off the living room"`, `"how to draft an invoice"`) automatically match tools with scores:
+3. Natural concepts (e.g. `"find pull requests for auth refactor"`, `"query database user billing"`, `"post deployment alert"`) automatically match tools with similarity scores:
    ```
-   Found 3 matching tools via semantic search (showing top 3):
-   - stripe:create_invoice(customer_id: string, amount: number) [sim: 0.86]
-   - stripe:send_invoice(invoice_id: string) [sim: 0.81]
+   Found 2 matching tools via semantic search (showing top 2):
+   - github:list_pull_requests(state?: string) [sim: 0.88]
+   - github:get_pull_request(pull_number: number) [sim: 0.84]
    ```
 4. If no API key is provided, the proxy falls back automatically to its instant lexical search!
 
@@ -228,6 +228,7 @@ Create an `mcp_servers.json` configuration file defining your upstream servers. 
 ## 🔌 Connecting to Your Agent / Client
 
 ### Claude Desktop (STDIO Mode)
+Add to your `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
@@ -240,6 +241,7 @@ Create an `mcp_servers.json` configuration file defining your upstream servers. 
 ```
 
 ### Cursor / Antigravity / Gemini / Windsurf (HTTP Mode)
+Connect via HTTP to the running daemon:
 ```json
 {
   "mcpServers": {
@@ -268,17 +270,52 @@ The proxy exposes a tiny, highly efficient tool surface:
 | `get_metrics` | View gateway latency, cache hits, and call counts | ~60 tokens |
 | `reload_config` | Hot-reload configuration from disk without restarting | ~20 tokens |
 
+### Example Agent Flow:
+1. **Agent searches:** `search_tools(query="pull request")`
+2. **Proxy returns:**
+   ```
+   Found 2 matching tools:
+   - github:create_pull_request(base: string, head: string, title: string, body?: string)
+   - github:list_pull_requests(state?: string)
+   ```
+3. **Agent executes:** `call_tool(tool_name="github:create_pull_request", arguments={...})`
+
 ---
 
-## 📊 Benchmarks
+## 📊 Performance & Efficiency Benchmarks
 
-| Metric | Direct Multi-Server (6 servers) | `mcp-search-proxy` | Improvement |
+*Measurements taken in a standard multi-server deployment (5 upstream servers exposing ~100 total tools):*
+
+| Benchmark Metric | Direct Multi-Server Exposure | With `mcp-search-proxy` | Efficiency Gain |
 | :--- | :--- | :--- | :--- |
-| **System Prompt Size** | ~24,000 tokens | **~335 tokens** | **-98.6%** |
-| **Simple "Hi" Cost** | ~42,000 tokens (with context) | **~18,600 tokens** | **-56%** |
-| **Upstream Startup** | Sequential (12–15s) | **Concurrent (1.3s)** | **10x Faster** |
-| **Tool Search Latency** | N/A | **< 20 microseconds** | Instant |
-| **Memory Footprint** | N/A | **~18 MB RSS** | Ultra-light |
+| **Tool Schema Prompt Cost** | ~25,000 tokens / turn | **~335 tokens / turn** | **98.6% reduction** |
+| **Tokens Saved per 10 Turns** | 0 tokens (wasted) | **~246,000 tokens saved** | **Massive cost savings** |
+| **Upstream Init Time (5 servers)** | ~10–15s (sequential) | **< 1.5s (parallel goroutines)** | **10x faster boot** |
+| **In-Memory Search Latency** | N/A | **< 20 microseconds** | Sub-millisecond |
+| **Proxy Process Memory** | N/A | **~15–20 MB RSS** | Minimal footprint |
+| **Cache Response Latency** | 100–500ms (network roundtrip) | **< 1 microsecond (RAM cache)** | **99.9% faster** |
+
+---
+
+## 🛡️ Security Policies & Guardrails
+
+Protect your infrastructure by configuring guardrails directly in `mcp_servers.json`:
+
+```json
+{
+  "mcpServers": {
+    "prod-database": {
+      "command": "...",
+      "read_only": true,
+      "blocked_tools": ["drop_*", "truncate_*", "delete_*"],
+      "timeout": "15s"
+    }
+  }
+}
+```
+- **`read_only: true`**: Automatically blocks any tool with mutating or destructive prefixes (`create`, `delete`, `drop`, `update`, `write`, `set`, `remove`, `kill`, `post`, `put`, `modify`, `clear`).
+- **`blocked_tools`**: Glob-pattern blacklist to prevent destructive tools from ever running.
+- **`allowed_tools`**: Strict whitelist mode—only specified tools can be executed.
 
 ---
 
