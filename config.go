@@ -14,6 +14,7 @@ type ServerConfig struct {
 	URL       string            `json:"url,omitempty"`
 	ServerURL string            `json:"serverUrl,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
+	Tags      []string          `json:"tags,omitempty"`
 }
 
 // GetURL returns either URL or ServerURL.

@@ -15,6 +15,34 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
+// Default semantic synonym dictionary for common agent queries
+var defaultSynonyms = map[string][]string{
+	"baby":       {"child", "infant", "huckleberry", "diaper", "feed", "sleep", "nursery", "growth"},
+	"infant":     {"baby", "child", "huckleberry", "nursery"},
+	"kid":        {"child", "baby", "huckleberry"},
+	"mail":       {"email", "gmail", "inbox", "message"},
+	"inbox":      {"email", "gmail", "mail", "message"},
+	"temp":       {"temperature", "climate", "thermostat"},
+	"ac":         {"climate", "thermostat", "temperature"},
+	"climate":    {"temperature", "thermostat", "hvac"},
+	"light":      {"home-assistant", "switch"},
+	"lights":     {"home-assistant", "switch"},
+	"package":    {"order", "orders", "amazon", "target", "walmart", "delivery"},
+	"packages":   {"order", "orders", "amazon", "target", "walmart", "delivery"},
+	"shopping":   {"order", "orders", "amazon", "target", "walmart"},
+	"delivery":   {"order", "orders", "shipping"},
+	"job":        {"jobs", "ats", "career", "hunter", "application", "company"},
+	"jobs":       {"job", "ats", "career", "hunter", "application", "company"},
+	"career":     {"job", "jobs", "ats", "hunter", "application"},
+	"recruiter":  {"job", "jobs", "email", "ats"},
+	"money":      {"tiller", "budget", "finance", "sheets", "orders", "account"},
+	"finance":    {"money", "tiller", "budget", "sheets", "orders"},
+	"finances":   {"money", "tiller", "budget", "sheets", "orders"},
+	"budget":     {"money", "tiller", "finance", "sheets"},
+	"sheet":      {"sheets", "spreadsheet", "tiller", "gsheets"},
+	"memory":     {"hindsight", "recall", "retain", "bank"},
+}
+
 // RegisteredTool wraps a tool and the client that provides it.
 type RegisteredTool struct {
 	ServerName string
@@ -24,18 +52,20 @@ type RegisteredTool struct {
 
 // Proxy manages upstream MCP clients and tool indexing.
 type Proxy struct {
-	logger  *slog.Logger
-	mu      sync.RWMutex
-	clients map[string]*client.Client
-	tools   map[string]*RegisteredTool
+	logger     *slog.Logger
+	mu         sync.RWMutex
+	clients    map[string]*client.Client
+	tools      map[string]*RegisteredTool
+	serverTags map[string][]string
 }
 
 // NewProxy creates a new Proxy instance.
 func NewProxy(logger *slog.Logger) *Proxy {
 	return &Proxy{
-		logger:  logger,
-		clients: make(map[string]*client.Client),
-		tools:   make(map[string]*RegisteredTool),
+		logger:     logger,
+		clients:    make(map[string]*client.Client),
+		tools:      make(map[string]*RegisteredTool),
+		serverTags: make(map[string][]string),
 	}
 }
 
@@ -44,6 +74,10 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 	var wg sync.WaitGroup
 
 	for name, srv := range cfg.MCPServers {
+		p.mu.Lock()
+		p.serverTags[name] = srv.Tags
+		p.mu.Unlock()
+
 		wg.Add(1)
 		go func(serverName string, s ServerConfig) {
 			defer wg.Done()
@@ -84,7 +118,6 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 			return
 		}
 	} else if srv.GetURL() != "" {
-		// Try Streamable HTTP transport first (modern MCP HTTP spec)
 		var httpOpts []transport.StreamableHTTPCOption
 		if len(srv.Headers) > 0 {
 			httpOpts = append(httpOpts, transport.WithHTTPHeaders(srv.Headers))
@@ -95,7 +128,6 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 			if startErr := c.Start(startCtx); startErr != nil {
 				cancelStart()
 				_ = c.Close()
-				// Fallback to legacy SSE transport
 				var sseOpts []transport.ClientOption
 				if len(srv.Headers) > 0 {
 					sseOpts = append(sseOpts, transport.WithHeaders(srv.Headers))
@@ -122,7 +154,6 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 		return
 	}
 
-	// Initialize upstream connection
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
@@ -139,7 +170,6 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 		return
 	}
 
-	// List tools
 	listCtx, cancelList := context.WithTimeout(ctx, 10*time.Second)
 	toolsResult, err := c.ListTools(listCtx, mcp.ListToolsRequest{})
 	cancelList()
@@ -164,7 +194,6 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	p.logger.Info("connected and indexed upstream", "server", name, "tool_count", len(toolsResult.Tools))
 }
 
-// HasTool returns true if the tool is known on any upstream server.
 func (p *Proxy) HasTool(toolName string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -172,7 +201,6 @@ func (p *Proxy) HasTool(toolName string) bool {
 	return ok
 }
 
-// GetTool returns the tool definition.
 func (p *Proxy) GetTool(toolName string) (mcp.Tool, string, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -183,13 +211,24 @@ func (p *Proxy) GetTool(toolName string) (mcp.Tool, string, bool) {
 	return reg.Tool, reg.ServerName, true
 }
 
-// SearchToolsFormatConcise formats search results into compact, readable signatures.
+// SearchToolsFormatConcise formats search results into compact, readable signatures with synonym expansion.
 func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	query = strings.TrimSpace(strings.ToLower(query))
-	tokens := strings.Fields(query)
+	rawTokens := strings.Fields(query)
+
+	// Build expanded token set with synonyms
+	tokenMap := make(map[string]bool)
+	for _, t := range rawTokens {
+		tokenMap[t] = true
+		if syns, ok := defaultSynonyms[t]; ok {
+			for _, syn := range syns {
+				tokenMap[syn] = true
+			}
+		}
+	}
 
 	type matchItem struct {
 		score int
@@ -206,16 +245,26 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 			nameLower := strings.ToLower(name)
 			descLower := strings.ToLower(reg.Tool.Description)
 			serverLower := strings.ToLower(reg.ServerName)
+			tags := p.serverTags[reg.ServerName]
 
-			for _, t := range tokens {
+			for t := range tokenMap {
+				// Exact token in name
 				if nameLower == t {
-					score += 10
+					score += 12
 				} else if strings.Contains(nameLower, t) {
-					score += 5
+					score += 6
 				}
+				// Server name match
 				if strings.Contains(serverLower, t) {
-					score += 3
+					score += 4
 				}
+				// Tag match
+				for _, tag := range tags {
+					if strings.Contains(strings.ToLower(tag), t) {
+						score += 5
+					}
+				}
+				// Description match
 				if strings.Contains(descLower, t) {
 					score += 2
 				}
@@ -252,7 +301,6 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 		t := matches[i].reg.Tool
 		server := matches[i].reg.ServerName
 
-		// Extract compact param signature
 		params := extractParamSignature(t.InputSchema)
 		desc := strings.TrimSpace(t.Description)
 		if len(desc) > 100 {
@@ -269,13 +317,13 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("To invoke any tool above: call it directly by name or via `call_tool(tool_name=\"...\")`.")
+	sb.WriteString("To invoke any tool above: call it via `call_tool(tool_name=\"...\")`.")
 	return sb.String()
 }
 
 func extractParamSignature(schema mcp.ToolInputSchema) string {
-	props := schema.Properties; ok := true
-	if !ok || len(props) == 0 {
+	props := schema.Properties
+	if len(props) == 0 {
 		return ""
 	}
 
@@ -309,7 +357,6 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	p.mu.RUnlock()
 
 	if !ok {
-		// Find close matches to help the LLM self-correct
 		suggestions := p.findSuggestions(toolName)
 		if len(suggestions) > 0 {
 			return nil, fmt.Errorf("tool %q not found. Did you mean: %s?", toolName, strings.Join(suggestions, ", "))
@@ -343,7 +390,6 @@ func (p *Proxy) findSuggestions(name string) []string {
 	return matches
 }
 
-// Close closes all upstream clients.
 func (p *Proxy) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
