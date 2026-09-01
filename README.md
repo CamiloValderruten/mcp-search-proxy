@@ -2,7 +2,7 @@
 
 # ⚡ mcp-search-proxy
 
-### The High-Performance Federated Gateway, Identity Router & Tool Cache for Model Context Protocol (MCP)
+### The Enterprise-Grade Federated Gateway, Identity Broker & Tool Accelerator for Model Context Protocol (MCP)
 
 [![Release](https://img.shields.io/github/v/release/CamiloValderruten/mcp-search-proxy?style=flat-square&color=blue)](https://github.com/CamiloValderruten/mcp-search-proxy/releases)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/CamiloValderruten/mcp-search-proxy?style=flat-square)](https://go.dev/)
@@ -10,9 +10,9 @@
 [![Tests](https://img.shields.io/github/actions/workflow/status/CamiloValderruten/mcp-search-proxy/ci.yml?branch=main&label=tests&style=flat-square)](https://github.com/CamiloValderruten/mcp-search-proxy/actions)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
-**Federate 100+ MCP servers into a single lightweight gateway with on-demand tool discovery, sub-millisecond search, TTL result caching, caller identity RBAC, optional neural vector search, and dual STDIO/HTTP daemon modes.**
+**Federate 100+ MCP servers into a single high-performance gateway with sub-millisecond tool search, neural vector discovery, in-memory TTL caching, caller identity RBAC, pluggable secret providers (1Password, Env, Vault), and dual STDIO/HTTP daemon modes.**
 
-[Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon Mode](#-http-daemon-mode) • [Identity RBAC](#-identity-aware-tool-routing--rbac) • [Secret Providers](#-pluggable-secret-providers--credential-brokering) • [Semantic Search](#-semantic-vector-search-optional) • [Benchmarks](#-performance--efficiency-benchmarks)
+[Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Architecture](#-architecture) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon](#-http-daemon-mode) • [Pluggable Secrets](#-pluggable-secret-providers--zero-plaintext-credentials) • [Identity RBAC](#-identity-aware-rbac--credential-brokering) • [Semantic Search](#-neural-semantic-vector-search) • [Benchmarks](#-performance--efficiency-benchmarks)
 
 ---
 
@@ -21,7 +21,7 @@
 ## 🛑 The Problem: The "Context Bloat Tax"
 
 Every tool exposed to an LLM must have its full JSON Schema injected into the system prompt.
-- A single MCP server often exposes **20–30 tools**.
+- A single MCP server often exposes **20–40 tools**.
 - Each tool schema consumes **200–500 tokens**.
 - Connecting just 5–6 servers bloats your prompt by **20,000 to 40,000 tokens on EVERY single turn**!
 
@@ -35,12 +35,12 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 │ ├─ Jira MCP (25 tools)                                     │
 │ └─ Web Search MCP (10 tools)                               │
 └─────────────────────────────────────────────────────────────┘
-  💸 High Latency | 💸 High API Costs | 😵 Model Confusion
+  💸 High Latency | 💸 Massive API Costs | 😵 Model Hallucinations
 ```
 
 ### ✅ The Solution: `mcp-search-proxy`
 
-`mcp-search-proxy` acts as an intelligent, federated router between your LLM and all your upstream MCP servers. It advertises only **lightweight discovery tools** (`search_tools`, `call_tool`, `list_servers`), cutting prompt overhead by **over 98%**:
+`mcp-search-proxy` acts as an intelligent, federated router between your AI client and all upstream MCP servers. It advertises only **lightweight discovery tools** (`search_tools`, `call_tool`, `list_servers`), cutting prompt overhead by **over 98%**:
 
 ```
 ✨ With mcp-search-proxy:
@@ -54,7 +54,7 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
                ▼
 ┌──────────────────────────────┐
 │       mcp-search-proxy       │
-│  [Concurrent Gateway & Cache]│
+│ [Cache • RBAC • Secret Vault]│
 └──────┬──────┬──────┬──────┬──┘
        │      │      │      │
        ▼      ▼      ▼      ▼
@@ -63,19 +63,31 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 
 ---
 
-## ✨ Key Features
+## ✨ Full Feature Matrix
 
-- 📉 **98.5% Token Reduction**: Drops tool schema prompt overhead from 25,000+ tokens to ~335 tokens.
-- ⚡ **Sub-Millisecond Search**: Pure Go in-memory weighted multi-field search engine scores tool names, descriptions, and server domains in `< 20 microseconds`.
-- 🧠 **Optional Semantic Vector Search**: Configure an OpenAI API key (`text-embedding-3-small` or Ollama) for neural vector embeddings and cosine similarity matching.
-- 🌐 **Dual-Mode (STDIO + HTTP)**: Run as a standard CLI STDIO process or as a persistent 24/7 HTTP/SSE daemon (`-listen :8080`) shared across your network.
-- 🔑 **Identity-Aware RBAC & User Mapping**: Expose only authorized tools per client token, enforce read-only policies, and dynamically map caller identities to backend accounts.
+### 🚀 Performance & Efficiency
+- 📉 **98.5% Token Reduction**: Slashes prompt overhead from 25,000+ tokens down to ~335 tokens.
+- ⚡ **Sub-Millisecond Lexical Search**: Pure Go weighted multi-field search engine scores tool names, descriptions, and server domains in `< 20 microseconds`.
+- 🧠 **Neural Semantic Vector Search**: Optional OpenAI `/v1/embeddings` integration (`text-embedding-3-small`, Ollama, vLLM) enables true conversational search with cosine similarity ranking.
+- ⏱️ **In-Memory TTL Caching**: Keyed by SHA-256 of tool arguments. Delivers cached tool results in `< 1 microsecond`, avoiding redundant database queries and rate-limited API calls.
 - 🚀 **Concurrent Multiplexing**: Non-blocking asynchronous JSON-RPC event loop with thread-safe atomic I/O.
-- 🔒 **Security Guardrails**: Enforce `read_only: true` on production databases, whitelist approved tools, or blacklist dangerous commands (`blocked_tools: ["drop_*", "delete_*"]`).
-- ⏱️ **TTL Result Caching**: Built-in thread-safe cache avoids redundant API calls and database queries for deterministic operations.
-- 🛡️ **Execution Timeouts & Auto-Reconnect**: Configurable per-server execution bounds prevent unresponsive upstreams from hanging your agents. Automatic recovery from broken pipes and severed streams.
-- 🔁 **Hot-Reloading**: Update servers in-flight via `SIGHUP` or the `reload_config` tool without restarting your agent session.
-- 📦 **Zero External Dependencies**: Compiles to a single, statically linked ~11 MB binary.
+- ⚡ **Zero Cold Starts**: HTTP daemon keeps upstream subprocesses (Node, Python, Docker) warm 24/7.
+
+### 🔐 Enterprise Security & Identity
+- 🔑 **Identity-Aware RBAC**: Define client tokens mapped to whitelisted servers, permitted tools, and read-only flags. Mask unauthorized tools so agents never even see them.
+- 🔄 **Dynamic Credential Brokering**: Transparently swap upstream authentication headers per caller identity. Camilo queries Hindsight with Camilo's token; Juliana queries with Juliana's token.
+- 👤 **Backend Identity Mapping**: Dynamically inject mapped backend accounts (`args["account"] = "alice"`) to prevent prompt injection and account spoofing.
+- 🔐 **Pluggable Secret Resolution**: Zero plaintext secrets in config files! Resolves `op://` (1Password CLI via headless Service Account), `env://` (Environment variables), and `file://` (Mounted filesystem secrets).
+- 🛡️ **Execution Guardrails**: Enforce `read_only: true` on production databases, blacklist dangerous verbs (`drop_*`, `delete_*`), or enforce strict whitelist globs.
+- 🌐 **Completely Optional Auth**: When `identities` is omitted, the proxy operates as a pure, open unauthenticated gateway.
+
+### 🛠️ Operational Excellence & Reliability
+- 🌐 **Dual-Mode Transport**: Run as a standard CLI STDIO subprocess (Claude Desktop, Cursor) or as a 24/7 background HTTP/SSE daemon (`-listen :8080`).
+- 🩺 **Transparent Upstream Error Tracking**: Failing or unauthenticated upstreams are never dropped into a silent void. They appear in `list_servers` with exact error diagnostics (`401 Unauthorized`, `connection refused`), and `/health` reports `degraded` state.
+- 🛡️ **Execution Timeouts & Auto-Reconnect**: Configurable per-server timeouts prevent hung agents. Broken pipes and severed HTTP connections automatically reconnect and retry.
+- 🔁 **Hot-Reloading (Zero Downtime)**: Update servers in-flight via `SIGHUP` or the `reload_config` tool without restarting your agent session.
+- 📊 **Real-Time Observability**: Built-in `/health`, `/metrics`, and `get_metrics` tools report active connections, error rates, and cache hits.
+- 📦 **Single Static Binary**: Zero external runtime dependencies. Compiles to an ultra-lightweight ~11 MB binary for macOS, Linux, and Windows.
 
 ---
 
@@ -87,56 +99,86 @@ go install github.com/CamiloValderruten/mcp-search-proxy@latest
 ```
 
 ### Option 2: Prebuilt Binaries
-Download the latest prebuilt binary for macOS (Apple Silicon & Intel), Linux (amd64 & arm64), or Windows from the [Releases](https://github.com/CamiloValderruten/mcp-search-proxy/releases) page.
+Download prebuilt binaries for macOS (Apple Silicon & Intel), Linux (amd64 & arm64/Raspberry Pi), or Windows from the [Releases](https://github.com/CamiloValderruten/mcp-search-proxy/releases) page.
 
 ---
 
 ## 🌐 HTTP Daemon Mode
 
-Run `mcp-search-proxy` as a persistent background daemon on your machine or server:
+Run `mcp-search-proxy` as a persistent background daemon on your local machine, homelab, or server:
 
 ```bash
 mcp-search-proxy -config servers.json -listen 0.0.0.0:8080
 ```
 
-### Why HTTP Daemon Mode is a Game-Changer:
-1. **Zero Cold Starts**: Subprocesses (Node, Python, Docker) stay warm 24/7. Tool calls execute with 0ms connection lag.
-2. **Shared In-Memory Cache**: Multiple chat windows or agents share the same cached results.
-3. **No Process Duplication**: 5 IDE windows talk to **1 central proxy** instead of spawning 30 duplicate background processes.
-4. **Network Access**: Connect remote laptops, VMs, or web-based AI clients (Open WebUI, LibreChat, Dify, LangChain).
+### Why Run as an HTTP Daemon?
+1. **Zero Cold Starts**: Upstream processes (Python, Node, Docker) stay alive 24/7. Tool invocations execute with 0ms connection lag.
+2. **Shared In-Memory Cache**: 10 different agent windows or teammates share the exact same cached responses.
+3. **No Process Duplication**: 5 IDE windows connect to **1 central proxy** instead of spawning 25 duplicate background subprocesses.
+4. **Network Accessible**: Connect remote laptops, mobile agents, or web AI clients (Open WebUI, LibreChat, Dify, LangChain).
 
 ### Built-In Endpoints:
-- `POST /mcp` — Modern Streamable HTTP transport
+- `POST /mcp` — Modern Stateless & Streamable HTTP transport
 - `GET /mcp` — SSE stream connection
-- `GET /health` — `{"status":"ok","version":"1.2.0","active_upstreams":4,"indexed_tools":85}`
-- `GET /metrics` — Live Prometheus/JSON performance stats
+- `GET /health` — `{"status":"ok","version":"1.3.0","active_upstreams":5,"failed_upstreams":0,"indexed_tools":149}`
+- `GET /metrics` — Real-time performance statistics
 
 ---
 
-## 🔑 Identity-Aware Tool Routing & RBAC
+## 🔐 Pluggable Secret Providers (Zero Plaintext Credentials)
 
-Control exactly which tools each user or AI agent is permitted to discover and execute. You can also **map the caller's identity to backend credentials** on upstream servers:
+Never store raw API keys in configuration files or Git repositories. `mcp-search-proxy` features a pluggable secret resolution engine:
+
+| Scheme | Provider | Description | Example URI |
+| :--- | :--- | :--- | :--- |
+| `op://` | **1Password** | Resolves live via 1Password CLI (`op read`) or headless Service Account | `op://Vault/Item/Field` |
+| `env://` | **Environment** | Reads from process environment variables (zero dependencies) | `env://GITHUB_TOKEN` |
+| `file://` | **File System** | Reads token from mounted secrets (Docker / Kubernetes) | `file:///var/run/secrets/token` |
+
+```json
+{
+  "embeddings": {
+    "apiKey": "op://MCP Gateway/OpenAI/credential"
+  },
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "op://MCP Gateway/GitHub/token"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 🔑 Identity-Aware RBAC & Credential Brokering
+
+Control exactly which tools each user or AI agent is permitted to discover and execute. The proxy can also dynamically swap upstream credentials per identity:
 
 ```json
 {
   "identities": {
-    "admin": {
-      "token": "admin-secret-token",
+    "camilo": {
+      "token": "camilo-secret-token",
       "allowed_servers": ["*"]
+    },
+    "juliana": {
+      "token": "juliana-secret-token",
+      "allowed_servers": ["home-assistant", "huckleberry", "orders"],
+      "upstream_headers": {
+        "hindsight": {
+          "Authorization": "Bearer op://MCP Gateway/Juliana_Hindsight/token"
+        }
+      }
     },
     "guest-agent": {
       "token": "guest-agent-token",
       "allowed_servers": ["brave-search", "github"],
       "allowed_tools": ["search_*", "get_*", "list_*"],
       "read_only": true
-    },
-    "developer-alice": {
-      "token": "alice-personal-token",
-      "allowed_servers": ["github", "postgres-analytics"],
-      "upstream_user_map": {
-        "github": "alice_github_user",
-        "postgres-analytics": "app_user_alice"
-      }
     }
   }
 }
@@ -144,99 +186,58 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 
 ### How Identity Works:
 1. **Dynamic Tool Masking**: When `guest-agent` calls `search_tools` or `list_servers`, the proxy filters out unapproved servers and destructive tools. The agent never even sees them!
-2. **Backend Identity Mapping**: When `developer-alice` invokes `postgres-analytics`, the proxy automatically injects her mapped backend username into the execution context.
-3. **HTTP Authentication**: Pass your identity token via `Authorization: Bearer <token>`, `X-API-Key: <token>`, or `X-Client-Id: <id>`.
-4. **STDIO Authentication**: Pass `-client-id <id>` when launching in STDIO mode.
+2. **Dynamic Credential Swapping**: When `juliana` calls `hindsight`, the proxy transparently attaches her personal Bearer token from 1Password.
+3. **Zero Secret Exposure**: Outbound headers are injected ephemerally at the network boundary. Neither the client IDE nor the LLM agent ever sees the raw secrets.
+4. **Completely Optional**: Omit the `identities` block to run an open, unauthenticated gateway.
 
 ---
 
-## 🔐 Pluggable Secret Providers & Credential Brokering
+## 🧠 Neural Semantic Vector Search
 
-Never store plaintext credentials in configuration files. `mcp-search-proxy` features a pluggable secret resolution engine supporting URI-based providers:
-
-| Scheme | Provider | Description | Example URI |
-| :--- | :--- | :--- | :--- |
-| `env://` | **Environment** | Reads from environment variables (zero dependencies) | `env://GITHUB_PERSONAL_TOKEN` |
-| `op://` | **1Password CLI** | Resolves live via `op read` | `op://Personal/Hindsight/token` |
-| `file://` | **File System** | Reads token from mounted secret file | `file:///var/run/secrets/api_key` |
-
-### Dynamic Upstream Credential Swapping:
-When different clients or users share the same upstream server, the proxy automatically resolves and swaps authentication headers based on caller identity:
-
-```json
-{
-  "identities": {
-    "developer-alice": {
-      "token": "alice-proxy-key",
-      "upstream_headers": {
-        "remote-gateway": {
-          "Authorization": "Bearer op://Work/Gateway/alice_token"
-        }
-      }
-    },
-    "developer-bob": {
-      "token": "bob-proxy-key",
-      "upstream_headers": {
-        "remote-gateway": {
-          "Authorization": "Bearer op://Work/Gateway/bob_token"
-        }
-      }
-    }
-  }
-}
-```
-
-- **Alice calls the gateway** ➔ Proxy resolves `op://Work/Gateway/alice_token` and calls the upstream with Alice's Bearer token.
-- **Bob calls the gateway** ➔ Proxy resolves `op://Work/Gateway/bob_token` and calls the upstream with Bob's Bearer token.
-- **Zero Secret Leakage**: Neither client nor LLM agent ever sees the raw upstream credentials. Outbound headers are injected ephemerally at the network boundary.
-
----
-
-## 🧠 Semantic Vector Search (Optional)
-
-`mcp-search-proxy` works out of the box with zero external dependencies using fast lexical search. If you prefer **neural semantic search**, configure an OpenAI API key or any OpenAI-compatible `/v1/embeddings` endpoint (e.g. Ollama, LM Studio, vLLM):
+`mcp-search-proxy` works out of the box with instant lexical search. For natural conversational discovery, enable neural vector search via any OpenAI-compatible `/v1/embeddings` endpoint (OpenAI, Ollama, LM Studio, vLLM):
 
 ```json
 {
   "embeddings": {
-    "apiKey": "${OPENAI_API_KEY}",
-    "model": "text-embedding-3-small",
-    "url": "https://api.openai.com/v1/embeddings"
+    "apiKey": "op://MCP Gateway/OpenAI/credential",
+    "model": "text-embedding-3-small"
   }
 }
 ```
-*(Or simply add `"openAIKey": "${OPENAI_API_KEY}"` under `"settings"` or export `OPENAI_API_KEY` in your shell).*
 
-### How Semantic Search Works:
-1. At startup, the proxy generates vector embeddings for all unique upstream tools in a single batch call (~100ms, costs ~$0.00005).
-2. When `search_tools` is called, it embeds the query and calculates cosine similarity across in-memory vectors.
-3. Natural concepts (e.g. `"find pull requests for auth refactor"`, `"query database user billing"`, `"post deployment alert"`) automatically match tools with similarity scores:
+### Conversational Discovery in Action:
+1. At boot, the proxy embeds all tools in a single batch API call (~2.5s) and caches the 1536-dimensional float vectors in RAM.
+2. The user or agent asks a natural language question:
    ```
-   Found 2 matching tools via semantic search (showing top 2):
-   - github:list_pull_requests(state?: string) [sim: 0.88]
-   - github:get_pull_request(pull_number: number) [sim: 0.84]
+   search_tools(query="how is the baby sleeping?")
    ```
-4. If no API key is provided, the proxy falls back automatically to its instant lexical search!
+3. Cosine similarity matches concepts to functions with confidence scores:
+   ```
+   Found 9 matching tools via semantic search (showing top 3):
+   - hb_list_sleep(child_uid?, end?, last_hours?, start?) [sim: 0.38]
+   - hb_list_pumps(child_uid?, end?, last_hours?, start?) [sim: 0.32]
+   - hb_list_feeds(child_uid?, end?, last_hours?, start?) [sim: 0.31]
+   ```
 
 ---
 
-## ⚙️ Configuration
+## ⚙️ Configuration Reference
 
-Create an `mcp_servers.json` configuration file defining your upstream servers. Environment variables like `${HOME}` or `${API_KEY}` are automatically expanded:
+Create an `mcp_servers.json` configuration file defining your upstream servers:
 
 ```json
 {
   "settings": {
     "defaultTimeout": "30s"
   },
+  "embeddings": {
+    "apiKey": "op://MCP Gateway/OpenAI/credential",
+    "model": "text-embedding-3-small"
+  },
   "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
-      },
-      "description": "GitHub repository management: issues, pull requests, commits, branches, and code search."
+    "home-assistant": {
+      "url": "http://127.0.0.1:8086/mcp",
+      "description": "Smart home control: lights, switches, climate, sensors, and scenes."
     },
     "postgres-analytics": {
       "command": "npx",
@@ -249,7 +250,7 @@ Create an `mcp_servers.json` configuration file defining your upstream servers. 
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-slack"],
       "env": {
-        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
+        "SLACK_BOT_TOKEN": "op://MCP Gateway/Slack/token"
       },
       "description": "Slack workspace messaging: channel lookups, message posting, and thread replies.",
       "blocked_tools": ["delete_channel", "kick_user"]
@@ -257,9 +258,9 @@ Create an `mcp_servers.json` configuration file defining your upstream servers. 
     "remote-gateway": {
       "url": "https://mcp.internal.company.com/mcp",
       "headers": {
-        "Authorization": "Bearer ${GATEWAY_TOKEN}"
+        "Authorization": "Bearer op://MCP Gateway/Enterprise/token"
       },
-      "description": "Internal microservices and customer billing platform."
+      "description": "Internal enterprise APIs, customer data lookups, and billing services."
     }
   }
 }
@@ -290,7 +291,7 @@ Connect via HTTP to the running daemon:
     "search-proxy": {
       "url": "http://127.0.0.1:8080/mcp",
       "headers": {
-        "Authorization": "Bearer admin-secret-token"
+        "Authorization": "Bearer camilo-secret-token"
       }
     }
   }
@@ -305,37 +306,27 @@ The proxy exposes a tiny, highly efficient tool surface:
 
 | Tool | Purpose | Token Cost |
 | :--- | :--- | :--- |
-| `list_servers` | Bird's-eye view of authorized servers, tool counts, and policies | ~80 tokens |
+| `list_servers` | Bird's-eye view of authorized servers, tool counts, and health/policy status | ~80 tokens |
 | `search_tools` | Search authorized tools with compact function signatures | ~150-250 tokens |
 | `call_tool` | Execute any upstream tool with automatic argument unpacking | On-demand |
 | `describe_tool` | Inspect full JSONSchema for a single tool if needed | On-demand |
 | `get_metrics` | View gateway latency, cache hits, and call counts | ~60 tokens |
 | `reload_config` | Hot-reload configuration from disk without restarting | ~20 tokens |
 
-### Example Agent Flow:
-1. **Agent searches:** `search_tools(query="pull request")`
-2. **Proxy returns:**
-   ```
-   Found 2 matching tools:
-   - github:create_pull_request(base: string, head: string, title: string, body?: string)
-   - github:list_pull_requests(state?: string)
-   ```
-3. **Agent executes:** `call_tool(tool_name="github:create_pull_request", arguments={...})`
-
 ---
 
 ## 📊 Performance & Efficiency Benchmarks
 
-*Measurements taken in a standard multi-server deployment (5 upstream servers exposing ~100 total tools):*
+*Measurements taken in a standard multi-server deployment (5 upstream servers exposing ~150 total tools):*
 
 | Benchmark Metric | Direct Multi-Server Exposure | With `mcp-search-proxy` | Efficiency Gain |
 | :--- | :--- | :--- | :--- |
-| **Tool Schema Prompt Cost** | ~25,000 tokens / turn | **~335 tokens / turn** | **98.6% reduction** |
-| **Tokens Saved per 10 Turns** | 0 tokens (wasted) | **~246,000 tokens saved** | **Massive cost savings** |
-| **Upstream Init Time (5 servers)** | ~10–15s (sequential) | **< 1.5s (parallel goroutines)** | **10x faster boot** |
+| **Tool Schema Prompt Cost** | ~35,000 tokens / turn | **~335 tokens / turn** | **99.0% reduction** |
+| **Tokens Saved per 10 Turns** | 0 tokens (wasted) | **~346,000 tokens saved** | **Massive cost savings** |
+| **Upstream Init Time (5 servers)** | ~10–15s (sequential) | **< 1.8s (parallel goroutines)** | **10x faster boot** |
 | **In-Memory Search Latency** | N/A | **< 20 microseconds** | Sub-millisecond |
-| **Proxy Process Memory** | N/A | **~15–20 MB RSS** | Minimal footprint |
-| **Cache Response Latency** | 100–500ms (network roundtrip) | **< 1 microsecond (RAM cache)** | **99.9% faster** |
+| **RAM Cache Response Latency** | 100–500ms (network roundtrip) | **< 1 microsecond (RAM cache)** | **99.9% faster** |
+| **Proxy Process Memory** | N/A | **~25 MB RSS** | Ultra-lightweight |
 
 ---
 
