@@ -251,7 +251,7 @@ func main() {
 	if *listenAddr != "" {
 		logger.Info("starting mcp-search-proxy in HTTP server mode", "addr", *listenAddr, "version", version)
 
-		mcpHTTPHandler := server.NewStreamableHTTPServer(s)
+		mcpHTTPHandler := server.NewStreamableHTTPServer(s, server.WithStateLess(true))
 
 		mux := http.NewServeMux()
 
@@ -275,7 +275,7 @@ func main() {
 		})
 
 		// 3. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
-		mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		handleMCP := func(w http.ResponseWriter, r *http.Request) {
 			reqCtx := r.Context()
 
 			// Extract auth token or client identity header
@@ -304,7 +304,10 @@ func main() {
 			}
 
 			mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
-		})
+		}
+
+		mux.HandleFunc("/mcp", handleMCP)
+		mux.HandleFunc("/mcp/", handleMCP)
 
 		httpServer := &http.Server{
 			Addr:         *listenAddr,
