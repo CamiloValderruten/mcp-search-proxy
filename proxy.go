@@ -94,6 +94,8 @@ type Proxy struct {
 	embedder    *Embedder
 	toolVectors map[string][]float32
 
+	secretMgr *SecretManager
+
 	totalCalls atomic.Uint64
 	cacheHits  atomic.Uint64
 	errors     atomic.Uint64
@@ -114,6 +116,7 @@ func NewProxy(logger *slog.Logger, defaultTimeout time.Duration) *Proxy {
 		identities:     make(map[string]IdentityConfig),
 		cache:          make(map[string]cacheEntry),
 		toolVectors:    make(map[string][]float32),
+		secretMgr:      NewSecretManager(5 * time.Minute),
 	}
 }
 
@@ -229,9 +232,31 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 			return nil, err
 		}
 	} else if srv.GetURL() != "" {
-		var httpOpts []transport.StreamableHTTPCOption
-		if len(srv.Headers) > 0 {
-			httpOpts = append(httpOpts, transport.WithHTTPHeaders(srv.Headers))
+		headerFunc := func(reqCtx context.Context) map[string]string {
+			merged := make(map[string]string)
+			for k, v := range srv.Headers {
+				if resolved, err := p.secretMgr.ResolveTemplate(reqCtx, v); err == nil {
+					merged[k] = resolved
+				} else {
+					merged[k] = v
+				}
+			}
+			if ident := GetCallerIdentity(reqCtx); ident != nil && ident.Config.UpstreamHeaders != nil {
+				if customHeaders, ok := ident.Config.UpstreamHeaders[name]; ok {
+					for k, v := range customHeaders {
+						if resolved, err := p.secretMgr.ResolveTemplate(reqCtx, v); err == nil {
+							merged[k] = resolved
+						} else {
+							p.logger.Error("failed to resolve upstream secret header", "server", name, "header", k, "err", err)
+						}
+					}
+				}
+			}
+			return merged
+		}
+
+		httpOpts := []transport.StreamableHTTPCOption{
+			transport.WithHTTPHeaderFunc(headerFunc),
 		}
 		c, err = client.NewStreamableHttpClient(srv.GetURL(), httpOpts...)
 		if err == nil {
@@ -239,9 +264,8 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 			if startErr := c.Start(startCtx); startErr != nil {
 				cancelStart()
 				_ = c.Close()
-				var sseOpts []transport.ClientOption
-				if len(srv.Headers) > 0 {
-					sseOpts = append(sseOpts, transport.WithHeaders(srv.Headers))
+				sseOpts := []transport.ClientOption{
+					transport.WithHeaderFunc(headerFunc),
 				}
 				c, err = client.NewSSEMCPClient(srv.GetURL(), sseOpts...)
 				if err != nil {
@@ -270,7 +294,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
 		Name:    "mcp-search-proxy",
-		Version: "1.2.0",
+		Version: "1.3.0",
 	}
 
 	initResult, err := c.Initialize(initCtx, initReq)

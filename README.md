@@ -12,7 +12,7 @@
 
 **Federate 100+ MCP servers into a single lightweight gateway with on-demand tool discovery, sub-millisecond search, TTL result caching, caller identity RBAC, optional neural vector search, and dual STDIO/HTTP daemon modes.**
 
-[Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon Mode](#-http-daemon-mode) • [Identity RBAC](#-identity-aware-tool-routing--rbac) • [Semantic Search](#-semantic-vector-search-optional) • [Benchmarks](#-performance--efficiency-benchmarks)
+[Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon Mode](#-http-daemon-mode) • [Identity RBAC](#-identity-aware-tool-routing--rbac) • [Secret Providers](#-pluggable-secret-providers--credential-brokering) • [Semantic Search](#-semantic-vector-search-optional) • [Benchmarks](#-performance--efficiency-benchmarks)
 
 ---
 
@@ -147,6 +147,48 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 2. **Backend Identity Mapping**: When `developer-alice` invokes `postgres-analytics`, the proxy automatically injects her mapped backend username into the execution context.
 3. **HTTP Authentication**: Pass your identity token via `Authorization: Bearer <token>`, `X-API-Key: <token>`, or `X-Client-Id: <id>`.
 4. **STDIO Authentication**: Pass `-client-id <id>` when launching in STDIO mode.
+
+---
+
+## 🔐 Pluggable Secret Providers & Credential Brokering
+
+Never store plaintext credentials in configuration files. `mcp-search-proxy` features a pluggable secret resolution engine supporting URI-based providers:
+
+| Scheme | Provider | Description | Example URI |
+| :--- | :--- | :--- | :--- |
+| `env://` | **Environment** | Reads from environment variables (zero dependencies) | `env://GITHUB_PERSONAL_TOKEN` |
+| `op://` | **1Password CLI** | Resolves live via `op read` | `op://Personal/Hindsight/token` |
+| `file://` | **File System** | Reads token from mounted secret file | `file:///var/run/secrets/api_key` |
+
+### Dynamic Upstream Credential Swapping:
+When different clients or users share the same upstream server, the proxy automatically resolves and swaps authentication headers based on caller identity:
+
+```json
+{
+  "identities": {
+    "developer-alice": {
+      "token": "alice-proxy-key",
+      "upstream_headers": {
+        "remote-gateway": {
+          "Authorization": "Bearer op://Work/Gateway/alice_token"
+        }
+      }
+    },
+    "developer-bob": {
+      "token": "bob-proxy-key",
+      "upstream_headers": {
+        "remote-gateway": {
+          "Authorization": "Bearer op://Work/Gateway/bob_token"
+        }
+      }
+    }
+  }
+}
+```
+
+- **Alice calls the gateway** ➔ Proxy resolves `op://Work/Gateway/alice_token` and calls the upstream with Alice's Bearer token.
+- **Bob calls the gateway** ➔ Proxy resolves `op://Work/Gateway/bob_token` and calls the upstream with Bob's Bearer token.
+- **Zero Secret Leakage**: Neither client nor LLM agent ever sees the raw upstream credentials. Outbound headers are injected ephemerally at the network boundary.
 
 ---
 

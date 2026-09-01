@@ -3,6 +3,10 @@
     "defaultTimeout": "30s",
     "authKey": "${GLOBAL_MCP_KEY}"
   },
+  "embeddings": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "model": "text-embedding-3-small"
+  },
   "identities": {
     "admin": {
       "token": "admin-secret-token",
@@ -17,10 +21,27 @@
     },
     "developer-alice": {
       "token": "alice-personal-token",
-      "allowed_servers": ["github", "postgres-analytics"],
+      "allowed_servers": ["github", "postgres-analytics", "remote-gateway"],
       "upstream_user_map": {
-        "github": "alice-github-id",
-        "postgres-analytics": "alice_analytics_role"
+        "github": "alice_github_user",
+        "postgres-analytics": "app_user_alice"
+      },
+      "upstream_headers": {
+        "remote-gateway": {
+          "Authorization": "Bearer op://Work/Gateway/alice_token"
+        },
+        "github": {
+          "Authorization": "Bearer env://ALICE_GITHUB_TOKEN"
+        }
+      }
+    },
+    "developer-bob": {
+      "token": "bob-personal-token",
+      "allowed_servers": ["remote-gateway"],
+      "upstream_headers": {
+        "remote-gateway": {
+          "Authorization": "Bearer op://Work/Gateway/bob_token"
+        }
       }
     }
   },

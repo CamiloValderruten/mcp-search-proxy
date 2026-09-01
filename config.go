@@ -55,14 +55,15 @@ func (s *ServerConfig) GetCacheTTL() time.Duration {
 	return d
 }
 
-// IdentityConfig defines RBAC and upstream identity mappings for a caller client.
+// IdentityConfig defines RBAC, upstream identity mappings, and dynamic credentials for a caller client.
 type IdentityConfig struct {
-	Token           string            `json:"token,omitempty"`             // Bearer token for HTTP auth
-	AllowedServers  []string          `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
-	AllowedTools    []string          `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")
-	BlockedTools    []string          `json:"blocked_tools,omitempty"`     // Blacklist of tool names/globs
-	ReadOnly        bool              `json:"read_only,omitempty"`         // If true, enforces read-only tool execution
-	UpstreamUserMap map[string]string `json:"upstream_user_map,omitempty"` // Map upstream server -> backend user/account id
+	Token           string                       `json:"token,omitempty"`             // Bearer token for HTTP auth
+	AllowedServers  []string                     `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
+	AllowedTools    []string                     `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")
+	BlockedTools    []string                     `json:"blocked_tools,omitempty"`     // Blacklist of tool names/globs
+	ReadOnly        bool                         `json:"read_only,omitempty"`         // If true, enforces read-only tool execution
+	UpstreamUserMap map[string]string            `json:"upstream_user_map,omitempty"` // Map upstream server -> backend user/account id
+	UpstreamHeaders map[string]map[string]string `json:"upstream_headers,omitempty"`  // Map upstream server -> headers with secret URIs (e.g. op://, env://)
 }
 
 // EmbeddingsConfig defines optional OpenAI-compatible vector embeddings for semantic search.
