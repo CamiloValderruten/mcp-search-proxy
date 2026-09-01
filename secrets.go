@@ -36,10 +36,27 @@ type OnePasswordSecretProvider struct{}
 
 func (p *OnePasswordSecretProvider) Scheme() string { return "op" }
 func (p *OnePasswordSecretProvider) Resolve(ctx context.Context, ref string) (string, error) {
-	cmd := exec.CommandContext(ctx, "op", "read", ref)
+	opPath, err := exec.LookPath("op")
+	if err != nil {
+		for _, fallback := range []string{
+			"/usr/local/bin/op",
+			"/home/camilovalderruten/.local/bin/op",
+			"/opt/homebrew/bin/op",
+		} {
+			if _, statErr := os.Stat(fallback); statErr == nil {
+				opPath = fallback
+				break
+			}
+		}
+	}
+	if opPath == "" {
+		opPath = "op"
+	}
+
+	cmd := exec.CommandContext(ctx, opPath, "read", ref)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("1password cli (op read) failed for reference %q: %w", ref, err)
+		return "", fmt.Errorf("1password cli (%s read) failed for reference %q: %w", opPath, ref, err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -137,6 +154,24 @@ func (sm *SecretManager) Resolve(ctx context.Context, ref string) (string, error
 
 // ResolveTemplate searches for secret URIs inside a string (e.g. "Bearer op://vault/item/token") and replaces them.
 func (sm *SecretManager) ResolveTemplate(ctx context.Context, template string) (string, error) {
+	template = strings.TrimSpace(template)
+	if strings.Contains(template, "://") {
+		// Case 1: "Bearer <scheme>://..."
+		if strings.HasPrefix(template, "Bearer ") {
+			ref := strings.TrimSpace(strings.TrimPrefix(template, "Bearer "))
+			val, err := sm.Resolve(ctx, ref)
+			if err != nil {
+				return "", err
+			}
+			return "Bearer " + val, nil
+		}
+		// Case 2: Exact direct URI "<scheme>://..."
+		parts := strings.SplitN(template, "://", 2)
+		if len(parts) == 2 && !strings.Contains(parts[0], " ") {
+			return sm.Resolve(ctx, template)
+		}
+	}
+
 	matches := uriRegex.FindAllString(template, -1)
 	if len(matches) == 0 {
 		return template, nil
