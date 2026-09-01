@@ -132,10 +132,15 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 	p.mu.Unlock()
 
 	// Configure optional OpenAI semantic embedder
-	apiKey := cfg.GetOpenAIKey()
-	if apiKey != "" {
-		p.embedder = NewEmbedder(apiKey, cfg.Embeddings.Model, cfg.Embeddings.URL)
-		p.logger.Info("semantic vector search enabled via OpenAI embeddings", "model", p.embedder.model)
+	rawKey := cfg.GetOpenAIKey()
+	if rawKey != "" {
+		apiKey, err := p.secretMgr.ResolveTemplate(ctx, rawKey)
+		if err == nil && apiKey != "" {
+			p.embedder = NewEmbedder(apiKey, cfg.Embeddings.Model, cfg.Embeddings.URL)
+			p.logger.Info("semantic vector search enabled via OpenAI embeddings", "model", p.embedder.model)
+		} else if err != nil {
+			p.logger.Error("failed to resolve embeddings api key secret", "err", err)
+		}
 	}
 
 	var wg sync.WaitGroup
