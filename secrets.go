@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -38,11 +39,13 @@ func (p *OnePasswordSecretProvider) Scheme() string { return "op" }
 func (p *OnePasswordSecretProvider) Resolve(ctx context.Context, ref string) (string, error) {
 	opPath, err := exec.LookPath("op")
 	if err != nil {
-		for _, fallback := range []string{
-			"/usr/local/bin/op",
-			"/home/camilovalderruten/.local/bin/op",
-			"/opt/homebrew/bin/op",
-		} {
+		var fallbacks []string
+		if home, hErr := os.UserHomeDir(); hErr == nil {
+			fallbacks = append(fallbacks, filepath.Join(home, ".local", "bin", "op"))
+		}
+		fallbacks = append(fallbacks, "/usr/local/bin/op", "/opt/homebrew/bin/op", "/usr/bin/op")
+
+		for _, fallback := range fallbacks {
 			if _, statErr := os.Stat(fallback); statErr == nil {
 				opPath = fallback
 				break
