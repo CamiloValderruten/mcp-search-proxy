@@ -412,7 +412,7 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 
 	counts := make(map[string]int)
 	for key, reg := range p.tools {
-		if !strings.Contains(key, ":") {
+		if strings.Contains(key, ":") {
 			if p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
 				counts[reg.ServerName]++
 			}
@@ -736,20 +736,33 @@ func extractParamSignature(schema mcp.ToolInputSchema) string {
 func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]any) (*mcp.CallToolResult, error) {
 	p.totalCalls.Add(1)
 
+	ident := GetCallerIdentity(ctx)
+
 	p.mu.RLock()
 	reg, ok := p.tools[toolName]
-	p.mu.RUnlock()
-
-	if !ok {
-		p.errors.Add(1)
-		suggestions := p.findSuggestions(toolName)
-		if len(suggestions) > 0 {
-			return nil, fmt.Errorf("tool %q not found. Did you mean: %s?", toolName, strings.Join(suggestions, ", "))
+	if !ok || (ident != nil && !p.isServerAccessible(ident, reg.ServerName)) {
+		found := false
+		for k, r := range p.tools {
+			if strings.Contains(k, ":") && r.Tool.Name == toolName {
+				if ident == nil || p.isServerAccessible(ident, r.ServerName) {
+					reg = r
+					found = true
+					ok = true
+					break
+				}
+			}
 		}
-		return nil, fmt.Errorf("tool %q not found across connected upstream servers", toolName)
+		if !found && !ok {
+			p.mu.RUnlock()
+			p.errors.Add(1)
+			suggestions := p.findSuggestions(toolName)
+			if len(suggestions) > 0 {
+				return nil, fmt.Errorf("tool %q not found. Did you mean: %s?", toolName, strings.Join(suggestions, ", "))
+			}
+			return nil, fmt.Errorf("tool %q not found across connected upstream servers", toolName)
+		}
 	}
-
-	ident := GetCallerIdentity(ctx)
+	p.mu.RUnlock()
 
 	// 1. Identity RBAC Enforcement
 	if ident != nil {
