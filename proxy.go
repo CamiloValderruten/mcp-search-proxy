@@ -38,86 +38,19 @@ func NewProxy(logger *slog.Logger) *Proxy {
 	}
 }
 
-// InitUpstreams connects to all configured upstream MCP servers and indexes their tools.
+// InitUpstreams connects to all configured upstream MCP servers concurrently and indexes their tools.
 func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
+	var wg sync.WaitGroup
+
 	for name, srv := range cfg.MCPServers {
-		p.logger.Info("connecting to upstream server", "server", name)
-
-		var (
-			c   *client.Client
-			err error
-		)
-
-		if srv.Command != "" {
-			var envSlice []string
-			// Inherit current environment, then override with custom env
-			for _, e := range os.Environ() {
-				envSlice = append(envSlice, e)
-			}
-			for k, v := range srv.Env {
-				envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
-			}
-			c, err = client.NewStdioMCPClient(srv.Command, envSlice, srv.Args...)
-			if err != nil {
-				p.logger.Error("failed to create stdio client", "server", name, "err", err)
-				continue
-			}
-		} else if srv.GetURL() != "" {
-			var opts []transport.ClientOption
-			if len(srv.Headers) > 0 {
-				opts = append(opts, transport.WithHeaders(srv.Headers))
-			}
-			c, err = client.NewSSEMCPClient(srv.GetURL(), opts...)
-			if err != nil {
-				p.logger.Error("failed to create sse client", "server", name, "url", srv.GetURL(), "err", err)
-				continue
-			}
-		} else {
-			p.logger.Warn("server has neither command nor url specified", "server", name)
-			continue
-		}
-
-		// Initialize upstream connection
-		initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		initReq := mcp.InitializeRequest{}
-		initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-		initReq.Params.ClientInfo = mcp.Implementation{
-			Name:    "mcp-search-proxy",
-			Version: "0.1.0",
-		}
-
-		_, err = c.Initialize(initCtx, initReq)
-		cancel()
-		if err != nil {
-			p.logger.Error("failed to initialize upstream server", "server", name, "err", err)
-			_ = c.Close()
-			continue
-		}
-
-		// List tools
-		listCtx, cancelList := context.WithTimeout(ctx, 10*time.Second)
-		toolsResult, err := c.ListTools(listCtx, mcp.ListToolsRequest{})
-		cancelList()
-		if err != nil {
-			p.logger.Error("failed to list tools from upstream", "server", name, "err", err)
-			_ = c.Close()
-			continue
-		}
-
-		p.mu.Lock()
-		p.clients[name] = c
-		for _, tool := range toolsResult.Tools {
-			p.tools[tool.Name] = &RegisteredTool{
-				ServerName: name,
-				Tool:       tool,
-				Client:     c,
-			}
-			p.logger.Debug("indexed tool", "server", name, "tool", tool.Name)
-		}
-		p.mu.Unlock()
-
-		p.logger.Info("connected and indexed upstream", "server", name, "tool_count", len(toolsResult.Tools))
+		wg.Add(1)
+		go func(serverName string, s ServerConfig) {
+			defer wg.Done()
+			p.initSingleUpstream(ctx, serverName, s)
+		}(name, srv)
 	}
+
+	wg.Wait()
 
 	p.mu.RLock()
 	totalTools := len(p.tools)
@@ -126,6 +59,108 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 
 	p.logger.Info("upstream initialization complete", "servers", totalClients, "total_tools", totalTools)
 	return nil
+}
+
+func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerConfig) {
+	p.logger.Info("connecting to upstream server", "server", name)
+
+	var (
+		c   *client.Client
+		err error
+	)
+
+	if srv.Command != "" {
+		var envSlice []string
+		for _, e := range os.Environ() {
+			envSlice = append(envSlice, e)
+		}
+		for k, v := range srv.Env {
+			envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
+		}
+		c, err = client.NewStdioMCPClient(srv.Command, envSlice, srv.Args...)
+		if err != nil {
+			p.logger.Error("failed to create stdio client", "server", name, "err", err)
+			return
+		}
+	} else if srv.GetURL() != "" {
+		// Try Streamable HTTP transport first (modern MCP HTTP spec)
+		var httpOpts []transport.StreamableHTTPCOption
+		if len(srv.Headers) > 0 {
+			httpOpts = append(httpOpts, transport.WithHTTPHeaders(srv.Headers))
+		}
+		c, err = client.NewStreamableHttpClient(srv.GetURL(), httpOpts...)
+		if err == nil {
+			startCtx, cancelStart := context.WithTimeout(ctx, 10*time.Second)
+			if startErr := c.Start(startCtx); startErr != nil {
+				cancelStart()
+				_ = c.Close()
+				// Fallback to legacy SSE transport
+				var sseOpts []transport.ClientOption
+				if len(srv.Headers) > 0 {
+					sseOpts = append(sseOpts, transport.WithHeaders(srv.Headers))
+				}
+				c, err = client.NewSSEMCPClient(srv.GetURL(), sseOpts...)
+				if err != nil {
+					p.logger.Error("failed to create sse client fallback", "server", name, "err", err)
+					return
+				}
+				sseStartCtx, cancelSSE := context.WithTimeout(ctx, 10*time.Second)
+				if err = c.Start(sseStartCtx); err != nil {
+					cancelSSE()
+					p.logger.Error("failed to start sse transport", "server", name, "err", err)
+					_ = c.Close()
+					return
+				}
+				cancelSSE()
+			} else {
+				cancelStart()
+			}
+		}
+	} else {
+		p.logger.Warn("server has neither command nor url specified", "server", name)
+		return
+	}
+
+	// Initialize upstream connection
+	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{
+		Name:    "mcp-search-proxy",
+		Version: "0.1.0",
+	}
+
+	_, err = c.Initialize(initCtx, initReq)
+	cancel()
+	if err != nil {
+		p.logger.Error("failed to initialize upstream server", "server", name, "err", err)
+		_ = c.Close()
+		return
+	}
+
+	// List tools
+	listCtx, cancelList := context.WithTimeout(ctx, 10*time.Second)
+	toolsResult, err := c.ListTools(listCtx, mcp.ListToolsRequest{})
+	cancelList()
+	if err != nil {
+		p.logger.Error("failed to list tools from upstream", "server", name, "err", err)
+		_ = c.Close()
+		return
+	}
+
+	p.mu.Lock()
+	p.clients[name] = c
+	for _, tool := range toolsResult.Tools {
+		p.tools[tool.Name] = &RegisteredTool{
+			ServerName: name,
+			Tool:       tool,
+			Client:     c,
+		}
+		p.logger.Debug("indexed tool", "server", name, "tool", tool.Name)
+	}
+	p.mu.Unlock()
+
+	p.logger.Info("connected and indexed upstream", "server", name, "tool_count", len(toolsResult.Tools))
 }
 
 // SearchTools finds tools matching a keyword query.
@@ -147,7 +182,6 @@ func (p *Proxy) SearchTools(query string) []map[string]any {
 			descLower := strings.ToLower(reg.Tool.Description)
 			serverLower := strings.ToLower(reg.ServerName)
 
-			// Match if any token is found
 			for _, t := range tokens {
 				if strings.Contains(nameLower, t) ||
 					strings.Contains(descLower, t) ||
