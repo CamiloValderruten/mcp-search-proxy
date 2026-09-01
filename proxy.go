@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -15,11 +20,12 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// RegisteredTool wraps a tool and the client that provides it.
+// RegisteredTool wraps a tool, its owning server name, configuration, and client.
 type RegisteredTool struct {
-	ServerName string
-	Tool       mcp.Tool
-	Client     *client.Client
+	ServerName   string
+	Tool         mcp.Tool
+	Client       *client.Client
+	ServerConfig ServerConfig
 }
 
 // ServerInfo holds metadata about an upstream server.
@@ -27,24 +33,55 @@ type ServerInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	ToolCount   int    `json:"tool_count"`
+	ReadOnly    bool   `json:"read_only,omitempty"`
 }
 
-// Proxy manages upstream MCP clients and tool indexing.
+type cacheEntry struct {
+	result    *mcp.CallToolResult
+	expiresAt time.Time
+}
+
+// Metrics tracks runtime performance and usage statistics.
+type Metrics struct {
+	TotalCalls     uint64 `json:"total_calls"`
+	CacheHits      uint64 `json:"cache_hits"`
+	Errors         uint64 `json:"errors"`
+	ActiveUpstreams int   `json:"active_upstreams"`
+	IndexedTools   int    `json:"indexed_tools"`
+}
+
+// Proxy manages upstream MCP clients, caching, security policies, and tool indexing.
 type Proxy struct {
-	logger      *slog.Logger
-	mu          sync.RWMutex
-	clients     map[string]*client.Client
-	tools       map[string]*RegisteredTool
-	serverDescs map[string]string
+	logger         *slog.Logger
+	defaultTimeout time.Duration
+
+	mu            sync.RWMutex
+	clients       map[string]*client.Client
+	tools         map[string]*RegisteredTool
+	serverConfigs map[string]ServerConfig
+	serverDescs   map[string]string
+
+	cacheMu sync.RWMutex
+	cache   map[string]cacheEntry
+
+	totalCalls atomic.Uint64
+	cacheHits  atomic.Uint64
+	errors     atomic.Uint64
 }
 
 // NewProxy creates a new Proxy instance.
-func NewProxy(logger *slog.Logger) *Proxy {
+func NewProxy(logger *slog.Logger, defaultTimeout time.Duration) *Proxy {
+	if defaultTimeout <= 0 {
+		defaultTimeout = 60 * time.Second
+	}
 	return &Proxy{
-		logger:      logger,
-		clients:     make(map[string]*client.Client),
-		tools:       make(map[string]*RegisteredTool),
-		serverDescs: make(map[string]string),
+		logger:         logger,
+		defaultTimeout: defaultTimeout,
+		clients:        make(map[string]*client.Client),
+		tools:          make(map[string]*RegisteredTool),
+		serverConfigs:  make(map[string]ServerConfig),
+		serverDescs:    make(map[string]string),
+		cache:          make(map[string]cacheEntry),
 	}
 }
 
@@ -54,6 +91,7 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 
 	for name, srv := range cfg.MCPServers {
 		p.mu.Lock()
+		p.serverConfigs[name] = srv
 		if srv.Description != "" {
 			p.serverDescs[name] = srv.Description
 		}
@@ -77,7 +115,7 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
-func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerConfig) {
+func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerConfig) (*client.Client, error) {
 	p.logger.Info("connecting to upstream server", "server", name)
 
 	var (
@@ -96,7 +134,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 		c, err = client.NewStdioMCPClient(srv.Command, envSlice, srv.Args...)
 		if err != nil {
 			p.logger.Error("failed to create stdio client", "server", name, "err", err)
-			return
+			return nil, err
 		}
 	} else if srv.GetURL() != "" {
 		var httpOpts []transport.StreamableHTTPCOption
@@ -116,14 +154,14 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 				c, err = client.NewSSEMCPClient(srv.GetURL(), sseOpts...)
 				if err != nil {
 					p.logger.Error("failed to create sse client fallback", "server", name, "err", err)
-					return
+					return nil, err
 				}
 				sseStartCtx, cancelSSE := context.WithTimeout(ctx, 10*time.Second)
 				if err = c.Start(sseStartCtx); err != nil {
 					cancelSSE()
 					p.logger.Error("failed to start sse transport", "server", name, "err", err)
 					_ = c.Close()
-					return
+					return nil, err
 				}
 				cancelSSE()
 			} else {
@@ -132,7 +170,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 		}
 	} else {
 		p.logger.Warn("server has neither command nor url specified", "server", name)
-		return
+		return nil, fmt.Errorf("server %q has neither command nor url", name)
 	}
 
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -140,7 +178,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
 		Name:    "mcp-search-proxy",
-		Version: "0.3.0",
+		Version: "1.0.0",
 	}
 
 	initResult, err := c.Initialize(initCtx, initReq)
@@ -148,10 +186,9 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	if err != nil {
 		p.logger.Error("failed to initialize upstream server", "server", name, "err", err)
 		_ = c.Close()
-		return
+		return nil, err
 	}
 
-	// Capture upstream server description if provided and not explicitly overridden
 	if srv.Description == "" && initResult != nil && initResult.ServerInfo.Description != "" {
 		p.mu.Lock()
 		p.serverDescs[name] = initResult.ServerInfo.Description
@@ -164,26 +201,32 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	if err != nil {
 		p.logger.Error("failed to list tools from upstream", "server", name, "err", err)
 		_ = c.Close()
-		return
+		return nil, err
 	}
 
 	p.mu.Lock()
 	p.clients[name] = c
 	for _, tool := range toolsResult.Tools {
 		reg := &RegisteredTool{
-			ServerName: name,
-			Tool:       tool,
-			Client:     c,
+			ServerName:   name,
+			Tool:         tool,
+			Client:       c,
+			ServerConfig: srv,
 		}
-		// Register by bare name
 		p.tools[tool.Name] = reg
-		// Also register by namespaced server:tool_name
 		p.tools[name+":"+tool.Name] = reg
 		p.logger.Debug("indexed tool", "server", name, "tool", tool.Name)
 	}
 	p.mu.Unlock()
 
 	p.logger.Info("connected and indexed upstream", "server", name, "tool_count", len(toolsResult.Tools))
+	return c, nil
+}
+
+// ReloadConfig dynamically reloads configuration and updates upstream servers in-flight.
+func (p *Proxy) ReloadConfig(ctx context.Context, cfg *Config) error {
+	p.logger.Info("reloading proxy configuration...")
+	return p.InitUpstreams(ctx, cfg)
 }
 
 func (p *Proxy) HasTool(toolName string) bool {
@@ -210,7 +253,6 @@ func (p *Proxy) ListServers() []ServerInfo {
 
 	counts := make(map[string]int)
 	for key, reg := range p.tools {
-		// Only count bare names, not namespaced aliases
 		if !strings.Contains(key, ":") {
 			counts[reg.ServerName]++
 		}
@@ -218,10 +260,12 @@ func (p *Proxy) ListServers() []ServerInfo {
 
 	var servers []ServerInfo
 	for name := range p.clients {
+		cfg := p.serverConfigs[name]
 		servers = append(servers, ServerInfo{
 			Name:        name,
 			Description: p.serverDescs[name],
 			ToolCount:   counts[name],
+			ReadOnly:    cfg.ReadOnly,
 		})
 	}
 
@@ -232,6 +276,27 @@ func (p *Proxy) ListServers() []ServerInfo {
 	return servers
 }
 
+// GetMetrics returns real-time usage statistics.
+func (p *Proxy) GetMetrics() Metrics {
+	p.mu.RLock()
+	activeUpstreams := len(p.clients)
+	toolCount := 0
+	for k := range p.tools {
+		if !strings.Contains(k, ":") {
+			toolCount++
+		}
+	}
+	p.mu.RUnlock()
+
+	return Metrics{
+		TotalCalls:      p.totalCalls.Load(),
+		CacheHits:       p.cacheHits.Load(),
+		Errors:          p.errors.Load(),
+		ActiveUpstreams: activeUpstreams,
+		IndexedTools:    toolCount,
+	}
+}
+
 // SearchToolsFormatConcise formats search results using weighted multi-field relevance scoring.
 func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	p.mu.RLock()
@@ -240,7 +305,6 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	query = strings.TrimSpace(strings.ToLower(query))
 	rawTokens := strings.Fields(query)
 
-	// Filter out common english noise stop-words
 	stopWords := map[string]bool{"a": true, "an": true, "the": true, "and": true, "or": true, "for": true, "to": true, "in": true, "of": true, "with": true, "on": true, "at": true}
 	var tokens []string
 	for _, t := range rawTokens {
@@ -258,7 +322,6 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	seen := make(map[string]bool)
 
 	for key, reg := range p.tools {
-		// Avoid duplicate scoring of namespaced aliases
 		if strings.Contains(key, ":") {
 			continue
 		}
@@ -273,29 +336,24 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 			serverDesc := strings.ToLower(p.serverDescs[reg.ServerName])
 
 			for _, t := range tokens {
-				// 1. Exact match in tool name (Highest confidence)
 				if nameLower == t {
 					score += 15
 				} else if strings.Contains(nameLower, t) {
 					score += 8
 				}
 
-				// 2. Server name match
 				if strings.Contains(serverLower, t) {
 					score += 5
 				}
 
-				// 3. Server description match
 				if strings.Contains(serverDesc, t) {
 					score += 4
 				}
 
-				// 4. Tool description match
 				if strings.Contains(descLower, t) {
 					score += 2
 				}
 
-				// 5. Parameter name match in schema
 				for pName := range reg.Tool.InputSchema.Properties {
 					if strings.Contains(strings.ToLower(pName), t) {
 						score += 1
@@ -312,7 +370,7 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	}
 
 	if len(matches) == 0 {
-		return fmt.Sprintf("No tools found matching %q. Try broader keywords, list servers via list_servers, or use '*' to list all.", query)
+		return fmt.Sprintf("No tools found matching %q. Try broader keywords or run list_servers.", query)
 	}
 
 	sort.Slice(matches, func(i, j int) bool {
@@ -385,13 +443,16 @@ func extractParamSignature(schema mcp.ToolInputSchema) string {
 	return strings.Join(parts, ", ")
 }
 
-// CallTool routes a tool call to the owning upstream client.
+// CallTool routes a tool call to the owning upstream client with timeouts, caching, and guardrail policies.
 func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]any) (*mcp.CallToolResult, error) {
+	p.totalCalls.Add(1)
+
 	p.mu.RLock()
 	reg, ok := p.tools[toolName]
 	p.mu.RUnlock()
 
 	if !ok {
+		p.errors.Add(1)
 		suggestions := p.findSuggestions(toolName)
 		if len(suggestions) > 0 {
 			return nil, fmt.Errorf("tool %q not found. Did you mean: %s?", toolName, strings.Join(suggestions, ", "))
@@ -399,13 +460,116 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 		return nil, fmt.Errorf("tool %q not found across connected upstream servers", toolName)
 	}
 
+	// 1. Policy Enforcement & Guardrails
+	if err := p.enforcePolicy(reg, args); err != nil {
+		p.errors.Add(1)
+		p.logger.Warn("tool call blocked by policy", "tool", toolName, "server", reg.ServerName, "err", err)
+		return nil, err
+	}
+
+	// 2. Cache Lookup
+	cacheKey := ""
+	cacheTTL := reg.ServerConfig.GetCacheTTL()
+	if cacheTTL > 0 {
+		cacheKey = p.computeCacheKey(reg.ServerName, reg.Tool.Name, args)
+		p.cacheMu.RLock()
+		entry, found := p.cache[cacheKey]
+		p.cacheMu.RUnlock()
+
+		if found && time.Now().Before(entry.expiresAt) {
+			p.cacheHits.Add(1)
+			p.logger.Debug("cache hit for tool call", "tool", toolName, "server", reg.ServerName)
+			return entry.result, nil
+		}
+	}
+
+	// 3. Execution with Bounded Timeout
+	timeout := reg.ServerConfig.GetTimeout(p.defaultTimeout)
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	req := mcp.CallToolRequest{}
-	// Use the original tool name on the upstream server, not the namespaced alias
 	req.Params.Name = reg.Tool.Name
 	req.Params.Arguments = args
 
-	p.logger.Info("forwarding call to upstream", "server", reg.ServerName, "tool", reg.Tool.Name)
-	return reg.Client.CallTool(ctx, req)
+	p.logger.Info("forwarding call to upstream", "server", reg.ServerName, "tool", reg.Tool.Name, "timeout", timeout)
+	res, err := reg.Client.CallTool(execCtx, req)
+
+	// 4. Auto-Reconnect Recovery on Broken Pipe
+	if err != nil && (strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "transport closed") || strings.Contains(err.Error(), "EOF")) {
+		p.logger.Warn("upstream connection severed, attempting automatic reconnection", "server", reg.ServerName)
+		newClient, reconnErr := p.initSingleUpstream(ctx, reg.ServerName, reg.ServerConfig)
+		if reconnErr == nil {
+			p.logger.Info("reconnection successful, retrying tool call", "server", reg.ServerName, "tool", reg.Tool.Name)
+			res, err = newClient.CallTool(execCtx, req)
+		}
+	}
+
+	if err != nil {
+		p.errors.Add(1)
+		if execCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("tool %q timed out after %s on upstream server %q", reg.Tool.Name, timeout, reg.ServerName)
+		}
+		return nil, err
+	}
+
+	// 5. Store in Cache if configured and successful
+	if cacheKey != "" && res != nil && !res.IsError {
+		p.cacheMu.Lock()
+		p.cache[cacheKey] = cacheEntry{
+			result:    res,
+			expiresAt: time.Now().Add(cacheTTL),
+		}
+		p.cacheMu.Unlock()
+	}
+
+	return res, nil
+}
+
+func (p *Proxy) enforcePolicy(reg *RegisteredTool, args map[string]any) error {
+	cfg := reg.ServerConfig
+
+	// Read-Only Enforcement
+	if cfg.ReadOnly {
+		nameLower := strings.ToLower(reg.Tool.Name)
+		destructiveVerbs := []string{"create", "delete", "drop", "update", "write", "set", "remove", "kill", "post", "put", "modify", "clear"}
+		for _, verb := range destructiveVerbs {
+			if strings.HasPrefix(nameLower, verb) || strings.Contains(nameLower, "_"+verb) {
+				return fmt.Errorf("security policy: server %q is configured in read_only mode; tool %q is blocked", reg.ServerName, reg.Tool.Name)
+			}
+		}
+	}
+
+	// Blacklist Check
+	for _, pattern := range cfg.BlockedTools {
+		matched, _ := filepath.Match(pattern, reg.Tool.Name)
+		if matched || pattern == reg.Tool.Name {
+			return fmt.Errorf("security policy: tool %q is explicitly blocked on server %q", reg.Tool.Name, reg.ServerName)
+		}
+	}
+
+	// Whitelist Check
+	if len(cfg.AllowedTools) > 0 {
+		allowed := false
+		for _, pattern := range cfg.AllowedTools {
+			matched, _ := filepath.Match(pattern, reg.Tool.Name)
+			if matched || pattern == reg.Tool.Name {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("security policy: tool %q is not in the allowed_tools whitelist for server %q", reg.Tool.Name, reg.ServerName)
+		}
+	}
+
+	return nil
+}
+
+func (p *Proxy) computeCacheKey(server, tool string, args map[string]any) string {
+	b, _ := json.Marshal(args)
+	h := sha256.Sum256(b)
+	return fmt.Sprintf("%s:%s:%s", server, tool, hex.EncodeToString(h[:]))
 }
 
 func (p *Proxy) findSuggestions(name string) []string {

@@ -1,21 +1,48 @@
 {
+  "settings": {
+    "defaultTimeout": "30s"
+  },
   "mcpServers": {
-    "gmail": {
+    "github": {
       "command": "npx",
-      "args": ["-y", "@artymclabin/gmail-mcp"]
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "description": "GitHub repository management: pull requests, issues, commits, branches, and code search.",
+      "timeout": "45s"
     },
-    "orders-mcp": {
-      "command": "node",
-      "args": ["/path/to/orders-mcp/src/stdio.js"]
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"],
+      "description": "PostgreSQL database queries, schema inspections, table operations, and analytics.",
+      "read_only": true,
+      "cache_ttl": "2m"
     },
-    "home-assistant": {
-      "url": "http://192.168.1.199:8086/mcp"
+    "slack": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "env": {
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
+      },
+      "description": "Slack workspace communication: channel messages, user lookups, threads, and notifications.",
+      "blocked_tools": ["delete_channel", "kick_user"]
     },
-    "hindsight": {
-      "url": "http://192.168.1.199:9000/mcp/",
+    "brave-search": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": {
+        "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+      },
+      "description": "Real-time web search, news aggregation, and URL lookup.",
+      "cache_ttl": "15m"
+    },
+    "remote-gateway": {
+      "url": "https://mcp.internal.company.com/mcp",
       "headers": {
-        "Authorization": "Bearer YOUR_TOKEN_HERE"
-      }
+        "Authorization": "Bearer ${GATEWAY_TOKEN}"
+      },
+      "description": "Internal enterprise APIs, customer data lookups, and billing services."
     }
   }
 }

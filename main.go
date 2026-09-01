@@ -11,13 +11,15 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var version = "0.3.0"
+var version = "1.0.0"
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -72,34 +74,61 @@ func main() {
 		os.Exit(1)
 	}
 
+	defaultTimeout := 60 * time.Second
+	if cfg.Settings.DefaultTimeout != "" {
+		if d, err := time.ParseDuration(cfg.Settings.DefaultTimeout); err == nil {
+			defaultTimeout = d
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Handle OS Signals (SIGINT, SIGTERM for graceful shutdown; SIGHUP for hot-reload)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		logger.Info("shutting down...")
+		logger.Info("shutting down proxy...")
 		cancel()
 	}()
 
-	proxy := NewProxy(logger)
+	proxy := NewProxy(logger, defaultTimeout)
 	defer proxy.Close()
 
 	if err := proxy.InitUpstreams(ctx, cfg); err != nil {
 		logger.Error("failed to initialize upstreams", "err", err)
 	}
 
+	// Listen for SIGHUP for hot-reloading
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupCh:
+				logger.Info("received SIGHUP, reloading configuration...", "path", *configPath)
+				if newCfg, err := LoadConfig(*configPath); err == nil {
+					_ = proxy.ReloadConfig(ctx, newCfg)
+				} else {
+					logger.Error("failed to reload config on SIGHUP", "err", err)
+				}
+			}
+		}
+	}()
+
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
-		server.WithDescription("Dynamic search & execution proxy for upstream MCP servers"),
+		server.WithDescription("High-performance dynamic search and federated gateway for Model Context Protocol servers"),
 	)
 
 	// Tool 1: list_servers
 	listServersTool := mcp.NewTool(
 		"list_servers",
-		mcp.WithDescription("List all connected upstream MCP servers, their descriptions, and tool counts."),
+		mcp.WithDescription("List all connected upstream MCP servers, their descriptions, tool counts, and security policies."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		servers := proxy.ListServers()
@@ -110,7 +139,11 @@ func main() {
 			if desc == "" {
 				desc = "No description provided"
 			}
-			sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools): %s\n", srv.Name, srv.ToolCount, desc))
+			roFlag := ""
+			if srv.ReadOnly {
+				roFlag = " `[read-only]`"
+			}
+			sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
 		}
 		return mcp.NewToolResultText(sb.String()), nil
 	})
@@ -118,30 +151,28 @@ func main() {
 	// Tool 2: search_tools
 	searchTool := mcp.NewTool(
 		"search_tools",
-		mcp.WithDescription("Search for available tools across upstream MCP servers. Returns tool names, signatures, and descriptions."),
-		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'email', 'nursery temperature', 'orders', or '*' for all).")),
+		mcp.WithDescription("Search for available tools across all connected upstream MCP servers. Returns tool names, signatures, and descriptions."),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
-
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := request.RequireString("query")
 		if err != nil {
-			return mcp.NewToolResultError("missing required string parameter 'query'"), nil
+			return mcp.NewToolResultError("missing required parameter 'query'"), nil
 		}
 		summary := proxy.SearchToolsFormatConcise(query, 8)
 		return mcp.NewToolResultText(summary), nil
 	})
 
-	// Tool 3: call_tool (relaxed & forgiving)
+	// Tool 3: call_tool
 	callTool := mcp.NewTool(
 		"call_tool",
 		mcp.WithDescription("Execute any tool on upstream servers by name. Accepts arguments either nested under 'arguments' or at top-level."),
-		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'search_emails' or 'gmail:search_emails').")),
+		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
-
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
-			return mcp.NewToolResultError("missing required string parameter 'tool_name'"), nil
+			return mcp.NewToolResultError("missing required parameter 'tool_name'"), nil
 		}
 
 		args := request.GetArguments()
@@ -158,13 +189,12 @@ func main() {
 		return res, nil
 	})
 
-	// Tool 4: describe_tool (optional schema inspection)
+	// Tool 4: describe_tool
 	describeTool := mcp.NewTool(
 		"describe_tool",
-		mcp.WithDescription("Get the detailed input schema and parameter descriptions for a single tool."),
+		mcp.WithDescription("Get the detailed input schema and parameter descriptions for a specific tool."),
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
 	)
-
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
@@ -186,7 +216,42 @@ func main() {
 		return mcp.NewToolResultText(string(data)), nil
 	})
 
-	logger.Info("starting stdio server loop for mcp-search-proxy")
+	// Tool 5: get_metrics
+	metricsTool := mcp.NewTool(
+		"get_metrics",
+		mcp.WithDescription("Get gateway performance metrics: total calls, cache hit ratio, error rates, and active upstreams."),
+	)
+	s.AddTool(metricsTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m := proxy.GetMetrics()
+		data, _ := json.MarshalIndent(m, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	})
+
+	// Tool 6: reload_config
+	reloadTool := mcp.NewTool(
+		"reload_config",
+		mcp.WithDescription("Reload configuration from disk in-flight without restarting the proxy."),
+	)
+	s.AddTool(reloadTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		newCfg, err := LoadConfig(*configPath)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load config from %s: %v", *configPath, err)), nil
+		}
+		if err := proxy.ReloadConfig(ctx, newCfg); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to reload upstreams: %v", err)), nil
+		}
+		return mcp.NewToolResultText("Configuration reloaded successfully."), nil
+	})
+
+	logger.Info("starting concurrent stdio server loop for mcp-search-proxy")
+
+	var stdoutMu sync.Mutex
+	writeOutput := func(b []byte) {
+		stdoutMu.Lock()
+		defer stdoutMu.Unlock()
+		b = append(b, '\n')
+		_, _ = os.Stdout.Write(b)
+	}
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -199,18 +264,27 @@ func main() {
 			break
 		}
 
-		var rpcReq jsonRPCRequest
-		if err := json.Unmarshal(line, &rpcReq); err != nil {
-			continue
-		}
+		lineCopy := make([]byte, len(line))
+		copy(lineCopy, line)
 
-		// Direct tool execution passthrough
-		if rpcReq.Method == "tools/call" && rpcReq.Params != nil {
-			var tp toolCallParams
-			if err := json.Unmarshal(rpcReq.Params, &tp); err == nil {
-				if tp.Name != "list_servers" && tp.Name != "search_tools" && tp.Name != "call_tool" && tp.Name != "describe_tool" {
-					if proxy.HasTool(tp.Name) {
-						logger.Info("transparent direct passthrough execution", "tool", tp.Name)
+		// Concurrent Request Multiplexing: process each request in a goroutine
+		go func(data []byte) {
+			var rpcReq jsonRPCRequest
+			if err := json.Unmarshal(data, &rpcReq); err != nil {
+				return
+			}
+
+			// Direct tool execution passthrough
+			if rpcReq.Method == "tools/call" && rpcReq.Params != nil {
+				var tp toolCallParams
+				if err := json.Unmarshal(rpcReq.Params, &tp); err == nil {
+					builtin := map[string]bool{
+						"list_servers": true, "search_tools": true,
+						"call_tool": true, "describe_tool": true,
+						"get_metrics": true, "reload_config": true,
+					}
+					if !builtin[tp.Name] && proxy.HasTool(tp.Name) {
+						logger.Debug("direct tool passthrough", "tool", tp.Name)
 						callRes, callErr := proxy.CallTool(ctx, tp.Name, tp.Arguments)
 						if callErr != nil {
 							callRes = mcp.NewToolResultError(callErr.Error())
@@ -222,21 +296,20 @@ func main() {
 							"result":  callRes,
 						}
 						respBytes, _ := json.Marshal(respMap)
-						respBytes = append(respBytes, '\n')
-						_, _ = os.Stdout.Write(respBytes)
-						continue
+						writeOutput(respBytes)
+						return
 					}
 				}
 			}
-		}
 
-		resp := s.HandleMessage(ctx, line)
-		if resp != nil {
-			respBytes, err := json.Marshal(resp)
-			if err == nil {
-				respBytes = append(respBytes, '\n')
-				_, _ = os.Stdout.Write(respBytes)
+			// Standard MCP server request handling
+			resp := s.HandleMessage(ctx, data)
+			if resp != nil {
+				respBytes, err := json.Marshal(resp)
+				if err == nil {
+					writeOutput(respBytes)
+				}
 			}
-		}
+		}(lineCopy)
 	}
 }
