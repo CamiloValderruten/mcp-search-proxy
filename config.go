@@ -65,17 +65,37 @@ type IdentityConfig struct {
 	UpstreamUserMap map[string]string `json:"upstream_user_map,omitempty"` // Map upstream server -> backend user/account id
 }
 
+// EmbeddingsConfig defines optional OpenAI-compatible vector embeddings for semantic search.
+type EmbeddingsConfig struct {
+	APIKey string `json:"apiKey,omitempty"` // OpenAI API Key (or env var OPENAI_API_KEY)
+	Model  string `json:"model,omitempty"`  // Default: text-embedding-3-small
+	URL    string `json:"url,omitempty"`    // Default: https://api.openai.com/v1/embeddings
+}
+
 // SettingsConfig defines global proxy options.
 type SettingsConfig struct {
 	DefaultTimeout string `json:"defaultTimeout,omitempty"` // Default "60s"
 	AuthKey        string `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
+	OpenAIKey      string `json:"openAIKey,omitempty"`      // Alternative shorthand for embeddings API key
 }
 
 // Config wraps the top-level MCP servers configuration.
 type Config struct {
 	Settings   SettingsConfig            `json:"settings,omitempty"`
+	Embeddings EmbeddingsConfig          `json:"embeddings,omitempty"`
 	Identities map[string]IdentityConfig `json:"identities,omitempty"`
 	MCPServers map[string]ServerConfig   `json:"mcpServers"`
+}
+
+// GetOpenAIKey returns the API key from Embeddings, Settings, or OPENAI_API_KEY environment variable.
+func (c *Config) GetOpenAIKey() string {
+	if c.Embeddings.APIKey != "" {
+		return c.Embeddings.APIKey
+	}
+	if c.Settings.OpenAIKey != "" {
+		return c.Settings.OpenAIKey
+	}
+	return os.Getenv("OPENAI_API_KEY")
 }
 
 // LoadConfig reads and parses the JSON configuration from disk, expanding environment variables.

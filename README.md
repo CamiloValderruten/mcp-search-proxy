@@ -66,6 +66,7 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 ## ✨ Key Features
 
 - 📉 **98.5% Token Reduction**: Drops tool schema prompt overhead from 25,000+ tokens to ~335 tokens.
+- 🧠 **Optional Semantic Vector Search**: Pass an OpenAI API key (`text-embedding-3-small` or Ollama) to enable neural vector embeddings and cosine similarity search alongside lexical scoring.
 - ⚡ **Sub-Millisecond Search**: Pure Go in-memory weighted multi-field search engine scores tool names, descriptions, and server domains in `< 20 microseconds`.
 - 🌐 **Dual-Mode (STDIO + HTTP)**: Run as a standard STDIO process for desktop agents or as a persistent 24/7 HTTP/SSE daemon (`-listen :8080`) shared across your network.
 - 🔑 **Identity-Aware RBAC & User Mapping**: Expose only authorized tools per client token, enforce read-only policies, and dynamically map caller identities to backend accounts.
@@ -146,6 +147,34 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 2. **Backend Identity Mapping**: When `developer-alice` invokes `postgres-analytics`, the proxy automatically injects her mapped backend username into the execution context.
 3. **HTTP Authentication**: Pass your identity token via `Authorization: Bearer <token>`, `X-API-Key: <token>`, or `X-Client-Id: <id>`.
 4. **STDIO Authentication**: Pass `-client-id <id>` when launching in STDIO mode.
+
+---
+ 
+ ## 🧠 Semantic Vector Search (Optional)
+
+`mcp-search-proxy` works out of the box with zero external dependencies using fast lexical search. If you prefer **neural semantic search**, configure an OpenAI API key or any OpenAI-compatible `/v1/embeddings` endpoint (e.g. Ollama, LM Studio, vLLM):
+
+```json
+{
+  "embeddings": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "model": "text-embedding-3-small",
+    "url": "https://api.openai.com/v1/embeddings"
+  }
+}
+```
+*(Or simply add `"openAIKey": "${OPENAI_API_KEY}"` under `"settings"`).*
+
+### How Semantic Search Works:
+1. At startup, the proxy generates vector embeddings for all upstream tools in a single batch call (~100ms, costs ~$0.00005).
+2. When `search_tools` is called, it embeds the query and calculates cosine similarity across in-memory vectors.
+3. Natural concepts (e.g. `"baby"`, `"something to turn off the living room"`, `"how to draft an invoice"`) automatically match tools with scores:
+   ```
+   Found 3 matching tools via semantic search (showing top 3):
+   - stripe:create_invoice(customer_id: string, amount: number) [sim: 0.86]
+   - stripe:send_invoice(invoice_id: string) [sim: 0.81]
+   ```
+4. If no API key is provided, the proxy falls back automatically to its instant lexical search!
 
 ---
 

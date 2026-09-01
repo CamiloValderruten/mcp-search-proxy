@@ -72,9 +72,10 @@ type Metrics struct {
 	Errors          uint64 `json:"errors"`
 	ActiveUpstreams int    `json:"active_upstreams"`
 	IndexedTools    int    `json:"indexed_tools"`
+	SemanticEnabled bool   `json:"semantic_enabled"`
 }
 
-// Proxy manages upstream MCP clients, caching, identity RBAC, and tool indexing.
+// Proxy manages upstream MCP clients, caching, identity RBAC, vector embeddings, and tool indexing.
 type Proxy struct {
 	logger         *slog.Logger
 	defaultTimeout time.Duration
@@ -88,6 +89,10 @@ type Proxy struct {
 
 	cacheMu sync.RWMutex
 	cache   map[string]cacheEntry
+
+	embedMu     sync.RWMutex
+	embedder    *Embedder
+	toolVectors map[string][]float32
 
 	totalCalls atomic.Uint64
 	cacheHits  atomic.Uint64
@@ -108,6 +113,7 @@ func NewProxy(logger *slog.Logger, defaultTimeout time.Duration) *Proxy {
 		serverDescs:    make(map[string]string),
 		identities:     make(map[string]IdentityConfig),
 		cache:          make(map[string]cacheEntry),
+		toolVectors:    make(map[string][]float32),
 	}
 }
 
@@ -116,6 +122,13 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 	p.mu.Lock()
 	p.identities = cfg.Identities
 	p.mu.Unlock()
+
+	// Configure optional OpenAI semantic embedder
+	apiKey := cfg.GetOpenAIKey()
+	if apiKey != "" {
+		p.embedder = NewEmbedder(apiKey, cfg.Embeddings.Model, cfg.Embeddings.URL)
+		p.logger.Info("semantic vector search enabled via OpenAI embeddings", "model", p.embedder.model)
+	}
 
 	var wg sync.WaitGroup
 
@@ -142,7 +155,56 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 	p.mu.RUnlock()
 
 	p.logger.Info("upstream initialization complete", "servers", totalClients, "total_tools", totalTools)
+
+	// If semantic search is enabled, compute embeddings for all unique tools in background
+	if p.embedder != nil {
+		go p.computeToolEmbeddings(context.Background())
+	}
+
 	return nil
+}
+
+func (p *Proxy) computeToolEmbeddings(ctx context.Context) {
+	p.mu.RLock()
+	var toolNames []string
+	var toolTexts []string
+
+	for key, reg := range p.tools {
+		if strings.Contains(key, ":") {
+			continue
+		}
+		serverDesc := p.serverDescs[reg.ServerName]
+		text := fmt.Sprintf("%s: %s - %s", reg.ServerName, reg.Tool.Name, reg.Tool.Description)
+		if serverDesc != "" {
+			text += fmt.Sprintf(" (%s)", serverDesc)
+		}
+		toolNames = append(toolNames, reg.Tool.Name)
+		toolTexts = append(toolTexts, text)
+	}
+	p.mu.RUnlock()
+
+	if len(toolTexts) == 0 {
+		return
+	}
+
+	p.logger.Info("generating vector embeddings for tools...", "count", len(toolTexts))
+	start := time.Now()
+
+	vectors, err := p.embedder.Embed(ctx, toolTexts)
+	if err != nil {
+		p.logger.Error("failed to generate vector embeddings", "err", err)
+		return
+	}
+
+	p.embedMu.Lock()
+	for i, name := range toolNames {
+		if i < len(vectors) && len(vectors[i]) > 0 {
+			p.toolVectors[name] = vectors[i]
+		}
+	}
+	p.embedMu.Unlock()
+
+	p.logger.Info("vector embeddings generated successfully", "count", len(toolNames), "elapsed", time.Since(start))
 }
 
 func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerConfig) (*client.Client, error) {
@@ -208,7 +270,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
 		Name:    "mcp-search-proxy",
-		Version: "1.1.0",
+		Version: "1.2.0",
 	}
 
 	initResult, err := c.Initialize(initCtx, initReq)
@@ -262,12 +324,10 @@ func (p *Proxy) ResolveIdentity(tokenOrID string) (string, IdentityConfig, bool)
 		return "", IdentityConfig{}, false
 	}
 
-	// Match by ID
 	if cfg, ok := p.identities[tokenOrID]; ok {
 		return tokenOrID, cfg, true
 	}
 
-	// Match by Token
 	for id, cfg := range p.identities {
 		if cfg.Token != "" && cfg.Token == tokenOrID {
 			return id, cfg, true
@@ -310,7 +370,6 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 	counts := make(map[string]int)
 	for key, reg := range p.tools {
 		if !strings.Contains(key, ":") {
-			// Check if tool is accessible to identity
 			if p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
 				counts[reg.ServerName]++
 			}
@@ -354,17 +413,114 @@ func (p *Proxy) GetMetrics() Metrics {
 	}
 	p.mu.RUnlock()
 
+	p.embedMu.RLock()
+	semanticEnabled := len(p.toolVectors) > 0
+	p.embedMu.RUnlock()
+
 	return Metrics{
 		TotalCalls:      p.totalCalls.Load(),
 		CacheHits:       p.cacheHits.Load(),
 		Errors:          p.errors.Load(),
 		ActiveUpstreams: activeUpstreams,
 		IndexedTools:    toolCount,
+		SemanticEnabled: semanticEnabled,
 	}
 }
 
-// SearchToolsFormatConcise formats search results filtered by caller identity.
+// SearchToolsFormatConcise formats search results using semantic embeddings (if enabled) or weighted lexical scoring.
 func (p *Proxy) SearchToolsFormatConcise(ctx context.Context, query string, limit int) string {
+	query = strings.TrimSpace(query)
+
+	// If semantic embeddings are active and query is not a wildcard, use semantic search!
+	p.embedMu.RLock()
+	hasEmbeddings := len(p.toolVectors) > 0
+	p.embedMu.RUnlock()
+
+	if hasEmbeddings && query != "" && query != "*" && p.embedder != nil {
+		if res, err := p.searchSemantic(ctx, query, limit); err == nil && res != "" {
+			return res
+		}
+	}
+
+	return p.searchLexical(ctx, query, limit)
+}
+
+func (p *Proxy) searchSemantic(ctx context.Context, query string, limit int) (string, error) {
+	queryVectors, err := p.embedder.Embed(ctx, []string{query})
+	if err != nil || len(queryVectors) == 0 || len(queryVectors[0]) == 0 {
+		return "", fmt.Errorf("embedding query failed: %w", err)
+	}
+	qVec := queryVectors[0]
+
+	ident := GetCallerIdentity(ctx)
+
+	type matchItem struct {
+		similarity float32
+		reg        *RegisteredTool
+	}
+
+	var matches []matchItem
+
+	p.mu.RLock()
+	p.embedMu.RLock()
+	for name, vec := range p.toolVectors {
+		reg, ok := p.tools[name]
+		if !ok {
+			continue
+		}
+		if !p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
+			continue
+		}
+		sim := CosineSimilarity(qVec, vec)
+		if sim > 0.25 { // Relevance threshold
+			matches = append(matches, matchItem{similarity: sim, reg: reg})
+		}
+	}
+	p.embedMu.RUnlock()
+	p.mu.RUnlock()
+
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no semantic matches found")
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].similarity > matches[j].similarity
+	})
+
+	if limit <= 0 || limit > len(matches) {
+		limit = len(matches)
+	}
+	if limit > 8 {
+		limit = 8
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Found %d matching tools via semantic search (showing top %d):\n\n", len(matches), limit))
+
+	for i := 0; i < limit; i++ {
+		t := matches[i].reg.Tool
+		server := matches[i].reg.ServerName
+		params := extractParamSignature(t.InputSchema)
+		desc := strings.TrimSpace(t.Description)
+		if len(desc) > 100 {
+			desc = desc[:97] + "..."
+		}
+
+		sb.WriteString(fmt.Sprintf("- **`%s`** (%s) `[sim: %.2f]`\n", t.Name, server, matches[i].similarity))
+		if params != "" {
+			sb.WriteString(fmt.Sprintf("  `%s(%s)`\n", t.Name, params))
+		}
+		if desc != "" {
+			sb.WriteString(fmt.Sprintf("  %s\n", desc))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("To invoke any tool above: call it via `call_tool(tool_name=\"...\")`.")
+	return sb.String(), nil
+}
+
+func (p *Proxy) searchLexical(ctx context.Context, query string, limit int) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -394,7 +550,6 @@ func (p *Proxy) SearchToolsFormatConcise(ctx context.Context, query string, limi
 			continue
 		}
 
-		// Identity-Aware Filtering
 		if !p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
 			continue
 		}
@@ -552,13 +707,12 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 			}
 		}
 
-		// 2. Dynamic Backend Identity Mapping (Caller Identity -> Backend User/Account)
+		// 2. Dynamic Backend Identity Mapping
 		if ident.Config.UpstreamUserMap != nil {
 			if backendUser, mapped := ident.Config.UpstreamUserMap[reg.ServerName]; mapped && backendUser != "" {
 				if args == nil {
 					args = make(map[string]any)
 				}
-				// Automatically bind backend identity to common account/user fields if not overridden
 				if _, hasAccount := args["account"]; !hasAccount {
 					args["account"] = backendUser
 				}
@@ -655,14 +809,12 @@ func (p *Proxy) isToolAccessible(ident *CallerIdentity, serverName, toolName str
 	if !p.isServerAccessible(ident, serverName) {
 		return false
 	}
-	// Blacklist check
 	for _, pattern := range ident.Config.BlockedTools {
 		matched, _ := filepath.Match(pattern, toolName)
 		if matched || pattern == toolName {
 			return false
 		}
 	}
-	// Whitelist check
 	if len(ident.Config.AllowedTools) > 0 {
 		allowed := false
 		for _, pattern := range ident.Config.AllowedTools {
