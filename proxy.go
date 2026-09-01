@@ -15,34 +15,6 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// Default semantic synonym dictionary for common agent queries
-var defaultSynonyms = map[string][]string{
-	"baby":       {"child", "infant", "huckleberry", "diaper", "feed", "sleep", "nursery", "growth"},
-	"infant":     {"baby", "child", "huckleberry", "nursery"},
-	"kid":        {"child", "baby", "huckleberry"},
-	"mail":       {"email", "gmail", "inbox", "message"},
-	"inbox":      {"email", "gmail", "mail", "message"},
-	"temp":       {"temperature", "climate", "thermostat"},
-	"ac":         {"climate", "thermostat", "temperature"},
-	"climate":    {"temperature", "thermostat", "hvac"},
-	"light":      {"home-assistant", "switch"},
-	"lights":     {"home-assistant", "switch"},
-	"package":    {"order", "orders", "amazon", "target", "walmart", "delivery"},
-	"packages":   {"order", "orders", "amazon", "target", "walmart", "delivery"},
-	"shopping":   {"order", "orders", "amazon", "target", "walmart"},
-	"delivery":   {"order", "orders", "shipping"},
-	"job":        {"jobs", "ats", "career", "hunter", "application", "company"},
-	"jobs":       {"job", "ats", "career", "hunter", "application", "company"},
-	"career":     {"job", "jobs", "ats", "hunter", "application"},
-	"recruiter":  {"job", "jobs", "email", "ats"},
-	"money":      {"tiller", "budget", "finance", "sheets", "orders", "account"},
-	"finance":    {"money", "tiller", "budget", "sheets", "orders"},
-	"finances":   {"money", "tiller", "budget", "sheets", "orders"},
-	"budget":     {"money", "tiller", "finance", "sheets"},
-	"sheet":      {"sheets", "spreadsheet", "tiller", "gsheets"},
-	"memory":     {"hindsight", "recall", "retain", "bank"},
-}
-
 // RegisteredTool wraps a tool and the client that provides it.
 type RegisteredTool struct {
 	ServerName string
@@ -50,22 +22,29 @@ type RegisteredTool struct {
 	Client     *client.Client
 }
 
+// ServerInfo holds metadata about an upstream server.
+type ServerInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	ToolCount   int    `json:"tool_count"`
+}
+
 // Proxy manages upstream MCP clients and tool indexing.
 type Proxy struct {
-	logger     *slog.Logger
-	mu         sync.RWMutex
-	clients    map[string]*client.Client
-	tools      map[string]*RegisteredTool
-	serverTags map[string][]string
+	logger      *slog.Logger
+	mu          sync.RWMutex
+	clients     map[string]*client.Client
+	tools       map[string]*RegisteredTool
+	serverDescs map[string]string
 }
 
 // NewProxy creates a new Proxy instance.
 func NewProxy(logger *slog.Logger) *Proxy {
 	return &Proxy{
-		logger:     logger,
-		clients:    make(map[string]*client.Client),
-		tools:      make(map[string]*RegisteredTool),
-		serverTags: make(map[string][]string),
+		logger:      logger,
+		clients:     make(map[string]*client.Client),
+		tools:       make(map[string]*RegisteredTool),
+		serverDescs: make(map[string]string),
 	}
 }
 
@@ -75,7 +54,9 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 
 	for name, srv := range cfg.MCPServers {
 		p.mu.Lock()
-		p.serverTags[name] = srv.Tags
+		if srv.Description != "" {
+			p.serverDescs[name] = srv.Description
+		}
 		p.mu.Unlock()
 
 		wg.Add(1)
@@ -159,15 +140,22 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
 		Name:    "mcp-search-proxy",
-		Version: "0.2.0",
+		Version: "0.3.0",
 	}
 
-	_, err = c.Initialize(initCtx, initReq)
+	initResult, err := c.Initialize(initCtx, initReq)
 	cancel()
 	if err != nil {
 		p.logger.Error("failed to initialize upstream server", "server", name, "err", err)
 		_ = c.Close()
 		return
+	}
+
+	// Capture upstream server description if provided and not explicitly overridden
+	if srv.Description == "" && initResult != nil && initResult.ServerInfo.Description != "" {
+		p.mu.Lock()
+		p.serverDescs[name] = initResult.ServerInfo.Description
+		p.mu.Unlock()
 	}
 
 	listCtx, cancelList := context.WithTimeout(ctx, 10*time.Second)
@@ -182,11 +170,15 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	p.mu.Lock()
 	p.clients[name] = c
 	for _, tool := range toolsResult.Tools {
-		p.tools[tool.Name] = &RegisteredTool{
+		reg := &RegisteredTool{
 			ServerName: name,
 			Tool:       tool,
 			Client:     c,
 		}
+		// Register by bare name
+		p.tools[tool.Name] = reg
+		// Also register by namespaced server:tool_name
+		p.tools[name+":"+tool.Name] = reg
 		p.logger.Debug("indexed tool", "server", name, "tool", tool.Name)
 	}
 	p.mu.Unlock()
@@ -211,7 +203,36 @@ func (p *Proxy) GetTool(toolName string) (mcp.Tool, string, bool) {
 	return reg.Tool, reg.ServerName, true
 }
 
-// SearchToolsFormatConcise formats search results into compact, readable signatures with synonym expansion.
+// ListServers returns a clean list of connected servers with tool counts and descriptions.
+func (p *Proxy) ListServers() []ServerInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	counts := make(map[string]int)
+	for key, reg := range p.tools {
+		// Only count bare names, not namespaced aliases
+		if !strings.Contains(key, ":") {
+			counts[reg.ServerName]++
+		}
+	}
+
+	var servers []ServerInfo
+	for name := range p.clients {
+		servers = append(servers, ServerInfo{
+			Name:        name,
+			Description: p.serverDescs[name],
+			ToolCount:   counts[name],
+		})
+	}
+
+	sort.Slice(servers, func(i, j int) bool {
+		return servers[i].Name < servers[j].Name
+	})
+
+	return servers
+}
+
+// SearchToolsFormatConcise formats search results using weighted multi-field relevance scoring.
 func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -219,14 +240,12 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	query = strings.TrimSpace(strings.ToLower(query))
 	rawTokens := strings.Fields(query)
 
-	// Build expanded token set with synonyms
-	tokenMap := make(map[string]bool)
+	// Filter out common english noise stop-words
+	stopWords := map[string]bool{"a": true, "an": true, "the": true, "and": true, "or": true, "for": true, "to": true, "in": true, "of": true, "with": true, "on": true, "at": true}
+	var tokens []string
 	for _, t := range rawTokens {
-		tokenMap[t] = true
-		if syns, ok := defaultSynonyms[t]; ok {
-			for _, syn := range syns {
-				tokenMap[syn] = true
-			}
+		if !stopWords[t] || len(rawTokens) == 1 {
+			tokens = append(tokens, t)
 		}
 	}
 
@@ -236,48 +255,64 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 	}
 
 	var matches []matchItem
+	seen := make(map[string]bool)
 
-	for name, reg := range p.tools {
+	for key, reg := range p.tools {
+		// Avoid duplicate scoring of namespaced aliases
+		if strings.Contains(key, ":") {
+			continue
+		}
+
 		score := 0
 		if query == "" || query == "*" {
 			score = 1
 		} else {
-			nameLower := strings.ToLower(name)
+			nameLower := strings.ToLower(reg.Tool.Name)
 			descLower := strings.ToLower(reg.Tool.Description)
 			serverLower := strings.ToLower(reg.ServerName)
-			tags := p.serverTags[reg.ServerName]
+			serverDesc := strings.ToLower(p.serverDescs[reg.ServerName])
 
-			for t := range tokenMap {
-				// Exact token in name
+			for _, t := range tokens {
+				// 1. Exact match in tool name (Highest confidence)
 				if nameLower == t {
-					score += 12
+					score += 15
 				} else if strings.Contains(nameLower, t) {
-					score += 6
+					score += 8
 				}
-				// Server name match
+
+				// 2. Server name match
 				if strings.Contains(serverLower, t) {
+					score += 5
+				}
+
+				// 3. Server description match
+				if strings.Contains(serverDesc, t) {
 					score += 4
 				}
-				// Tag match
-				for _, tag := range tags {
-					if strings.Contains(strings.ToLower(tag), t) {
-						score += 5
-					}
-				}
-				// Description match
+
+				// 4. Tool description match
 				if strings.Contains(descLower, t) {
 					score += 2
+				}
+
+				// 5. Parameter name match in schema
+				for pName := range reg.Tool.InputSchema.Properties {
+					if strings.Contains(strings.ToLower(pName), t) {
+						score += 1
+						break
+					}
 				}
 			}
 		}
 
-		if score > 0 {
+		if score > 0 && !seen[reg.Tool.Name] {
+			seen[reg.Tool.Name] = true
 			matches = append(matches, matchItem{score: score, reg: reg})
 		}
 	}
 
 	if len(matches) == 0 {
-		return fmt.Sprintf("No tools found matching %q. Try broader keywords or '*' to list all.", query)
+		return fmt.Sprintf("No tools found matching %q. Try broader keywords, list servers via list_servers, or use '*' to list all.", query)
 	}
 
 	sort.Slice(matches, func(i, j int) bool {
@@ -365,10 +400,11 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	}
 
 	req := mcp.CallToolRequest{}
-	req.Params.Name = toolName
+	// Use the original tool name on the upstream server, not the namespaced alias
+	req.Params.Name = reg.Tool.Name
 	req.Params.Arguments = args
 
-	p.logger.Info("forwarding call to upstream", "server", reg.ServerName, "tool", toolName)
+	p.logger.Info("forwarding call to upstream", "server", reg.ServerName, "tool", reg.Tool.Name)
 	return reg.Client.CallTool(ctx, req)
 }
 
@@ -378,10 +414,16 @@ func (p *Proxy) findSuggestions(name string) []string {
 
 	nameLower := strings.ToLower(name)
 	var matches []string
-	for t := range p.tools {
-		tLower := strings.ToLower(t)
-		if strings.Contains(tLower, nameLower) || strings.Contains(nameLower, tLower) {
-			matches = append(matches, t)
+	seen := make(map[string]bool)
+
+	for t, reg := range p.tools {
+		if strings.Contains(t, ":") {
+			continue
+		}
+		tLower := strings.ToLower(reg.Tool.Name)
+		if (strings.Contains(tLower, nameLower) || strings.Contains(nameLower, tLower)) && !seen[reg.Tool.Name] {
+			seen[reg.Tool.Name] = true
+			matches = append(matches, reg.Tool.Name)
 			if len(matches) >= 3 {
 				break
 			}
