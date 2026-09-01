@@ -55,15 +55,27 @@ func (s *ServerConfig) GetCacheTTL() time.Duration {
 	return d
 }
 
+// IdentityConfig defines RBAC and upstream identity mappings for a caller client.
+type IdentityConfig struct {
+	Token           string            `json:"token,omitempty"`             // Bearer token for HTTP auth
+	AllowedServers  []string          `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
+	AllowedTools    []string          `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")
+	BlockedTools    []string          `json:"blocked_tools,omitempty"`     // Blacklist of tool names/globs
+	ReadOnly        bool              `json:"read_only,omitempty"`         // If true, enforces read-only tool execution
+	UpstreamUserMap map[string]string `json:"upstream_user_map,omitempty"` // Map upstream server -> backend user/account id
+}
+
 // SettingsConfig defines global proxy options.
 type SettingsConfig struct {
 	DefaultTimeout string `json:"defaultTimeout,omitempty"` // Default "60s"
+	AuthKey        string `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
 }
 
 // Config wraps the top-level MCP servers configuration.
 type Config struct {
-	Settings   SettingsConfig          `json:"settings,omitempty"`
-	MCPServers map[string]ServerConfig `json:"mcpServers"`
+	Settings   SettingsConfig            `json:"settings,omitempty"`
+	Identities map[string]IdentityConfig `json:"identities,omitempty"`
+	MCPServers map[string]ServerConfig   `json:"mcpServers"`
 }
 
 // LoadConfig reads and parses the JSON configuration from disk, expanding environment variables.
@@ -73,7 +85,6 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file %q: %w", path, err)
 	}
 
-	// Expand ${ENV_VAR} syntax in config
 	expanded := os.ExpandEnv(string(data))
 
 	var cfg Config

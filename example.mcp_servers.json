@@ -1,6 +1,28 @@
 {
   "settings": {
-    "defaultTimeout": "30s"
+    "defaultTimeout": "30s",
+    "authKey": "${GLOBAL_MCP_KEY}"
+  },
+  "identities": {
+    "admin": {
+      "token": "admin-secret-token",
+      "allowed_servers": ["*"],
+      "allowed_tools": ["*"]
+    },
+    "guest-agent": {
+      "token": "guest-agent-token",
+      "allowed_servers": ["brave-search", "github"],
+      "allowed_tools": ["search_*", "get_*", "list_*"],
+      "read_only": true
+    },
+    "developer-alice": {
+      "token": "alice-personal-token",
+      "allowed_servers": ["github", "postgres-analytics"],
+      "upstream_user_map": {
+        "github": "alice-github-id",
+        "postgres-analytics": "alice_analytics_role"
+      }
+    }
   },
   "mcpServers": {
     "github": {
@@ -9,15 +31,15 @@
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
       },
-      "description": "GitHub repository management: pull requests, issues, commits, branches, and code search.",
+      "description": "GitHub repository management: issues, pull requests, commits, branches, and code search.",
       "timeout": "45s"
     },
-    "postgres": {
+    "postgres-analytics": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"],
-      "description": "PostgreSQL database queries, schema inspections, table operations, and analytics.",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/analytics"],
+      "description": "Read-only PostgreSQL database queries, metrics, and schema inspection.",
       "read_only": true,
-      "cache_ttl": "2m"
+      "cache_ttl": "5m"
     },
     "slack": {
       "command": "npx",
@@ -25,7 +47,7 @@
       "env": {
         "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
       },
-      "description": "Slack workspace communication: channel messages, user lookups, threads, and notifications.",
+      "description": "Slack workspace messaging: channel lookups, message posting, and thread replies.",
       "blocked_tools": ["delete_channel", "kick_user"]
     },
     "brave-search": {

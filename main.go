@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,7 +20,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var version = "1.0.0"
+var version = "1.1.0"
 
 type jsonRPCRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -35,6 +36,8 @@ type toolCallParams struct {
 
 func main() {
 	configPath := flag.String("config", "", "Path to MCP servers configuration JSON file")
+	listenAddr := flag.String("listen", "", "Optional HTTP listen address (e.g. ':8080' or '127.0.0.1:8080'). If omitted, runs in STDIO mode.")
+	clientID := flag.String("client-id", "", "Caller identity for STDIO mode (maps to identities in config)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	flag.Parse()
@@ -84,7 +87,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle OS Signals (SIGINT, SIGTERM for graceful shutdown; SIGHUP for hot-reload)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -122,16 +124,16 @@ func main() {
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
-		server.WithDescription("High-performance dynamic search and federated gateway for Model Context Protocol servers"),
+		server.WithDescription("High-performance federated gateway and identity-aware tool router for Model Context Protocol"),
 	)
 
 	// Tool 1: list_servers
 	listServersTool := mcp.NewTool(
 		"list_servers",
-		mcp.WithDescription("List all connected upstream MCP servers, their descriptions, tool counts, and security policies."),
+		mcp.WithDescription("List all connected upstream MCP servers, descriptions, tool counts, and security policies accessible to your identity."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		servers := proxy.ListServers()
+		servers := proxy.ListServers(ctx)
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Connected Upstream Servers (%d):\n\n", len(servers)))
 		for _, srv := range servers {
@@ -151,7 +153,7 @@ func main() {
 	// Tool 2: search_tools
 	searchTool := mcp.NewTool(
 		"search_tools",
-		mcp.WithDescription("Search for available tools across all connected upstream MCP servers. Returns tool names, signatures, and descriptions."),
+		mcp.WithDescription("Search for available tools across connected upstream MCP servers accessible to your identity. Returns signatures and descriptions."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -159,14 +161,14 @@ func main() {
 		if err != nil {
 			return mcp.NewToolResultError("missing required parameter 'query'"), nil
 		}
-		summary := proxy.SearchToolsFormatConcise(query, 8)
+		summary := proxy.SearchToolsFormatConcise(ctx, query, 8)
 		return mcp.NewToolResultText(summary), nil
 	})
 
 	// Tool 3: call_tool
 	callTool := mcp.NewTool(
 		"call_tool",
-		mcp.WithDescription("Execute any tool on upstream servers by name. Accepts arguments either nested under 'arguments' or at top-level."),
+		mcp.WithDescription("Execute any authorized tool on upstream servers by name. Accepts arguments either nested under 'arguments' or at top-level."),
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -243,7 +245,103 @@ func main() {
 		return mcp.NewToolResultText("Configuration reloaded successfully."), nil
 	})
 
-	logger.Info("starting concurrent stdio server loop for mcp-search-proxy")
+	// -------------------------------------------------------------
+	// MODE A: HTTP Server Mode (-listen flag provided)
+	// -------------------------------------------------------------
+	if *listenAddr != "" {
+		logger.Info("starting mcp-search-proxy in HTTP server mode", "addr", *listenAddr, "version", version)
+
+		mcpHTTPHandler := server.NewStreamableHTTPServer(s)
+
+		mux := http.NewServeMux()
+
+		// 1. Healthcheck Endpoint
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			m := proxy.GetMetrics()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "ok",
+				"version":          version,
+				"active_upstreams": m.ActiveUpstreams,
+				"indexed_tools":    m.IndexedTools,
+			})
+		})
+
+		// 2. Metrics Endpoint
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			m := proxy.GetMetrics()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(m)
+		})
+
+		// 3. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
+		mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+			reqCtx := r.Context()
+
+			// Extract auth token or client identity header
+			authHeader := r.Header.Get("Authorization")
+			token := ""
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+			} else if k := r.Header.Get("X-API-Key"); k != "" {
+				token = k
+			} else if id := r.Header.Get("X-Client-Id"); id != "" {
+				token = id
+			}
+
+			// Check global authKey if configured
+			if cfg.Settings.AuthKey != "" && token != cfg.Settings.AuthKey {
+				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
+					reqCtx = WithIdentity(reqCtx, id, identCfg)
+				} else {
+					http.Error(w, "Unauthorized: invalid bearer token or client identity", http.StatusUnauthorized)
+					return
+				}
+			} else if token != "" {
+				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
+					reqCtx = WithIdentity(reqCtx, id, identCfg)
+				}
+			}
+
+			mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
+		})
+
+		httpServer := &http.Server{
+			Addr:         *listenAddr,
+			Handler:      mux,
+			ReadTimeout:  120 * time.Second,
+			WriteTimeout: 120 * time.Second,
+		}
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelShutdown()
+			_ = httpServer.Shutdown(shutdownCtx)
+		}()
+
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("http server failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// -------------------------------------------------------------
+	// MODE B: STDIO Mode (default)
+	// -------------------------------------------------------------
+	logger.Info("starting mcp-search-proxy in STDIO mode", "version", version)
+
+	// Attach STDIO caller identity if provided via flag
+	baseCtx := ctx
+	if *clientID != "" {
+		if id, identCfg, ok := proxy.ResolveIdentity(*clientID); ok {
+			baseCtx = WithIdentity(baseCtx, id, identCfg)
+			logger.Info("running STDIO session with caller identity", "client_id", id)
+		} else {
+			logger.Warn("client-id flag provided but not found in config identities", "client_id", *clientID)
+		}
+	}
 
 	var stdoutMu sync.Mutex
 	writeOutput := func(b []byte) {
@@ -267,7 +365,6 @@ func main() {
 		lineCopy := make([]byte, len(line))
 		copy(lineCopy, line)
 
-		// Concurrent Request Multiplexing: process each request in a goroutine
 		go func(data []byte) {
 			var rpcReq jsonRPCRequest
 			if err := json.Unmarshal(data, &rpcReq); err != nil {
@@ -285,7 +382,7 @@ func main() {
 					}
 					if !builtin[tp.Name] && proxy.HasTool(tp.Name) {
 						logger.Debug("direct tool passthrough", "tool", tp.Name)
-						callRes, callErr := proxy.CallTool(ctx, tp.Name, tp.Arguments)
+						callRes, callErr := proxy.CallTool(baseCtx, tp.Name, tp.Arguments)
 						if callErr != nil {
 							callRes = mcp.NewToolResultError(callErr.Error())
 						}
@@ -303,7 +400,7 @@ func main() {
 			}
 
 			// Standard MCP server request handling
-			resp := s.HandleMessage(ctx, data)
+			resp := s.HandleMessage(baseCtx, data)
 			if resp != nil {
 				respBytes, err := json.Marshal(resp)
 				if err == nil {

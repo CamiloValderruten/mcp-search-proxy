@@ -20,6 +20,30 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
+type identityContextKey struct{}
+
+// CallerIdentity represents the authenticated client making the request.
+type CallerIdentity struct {
+	ID     string
+	Config IdentityConfig
+}
+
+// WithIdentity returns a new context with the caller identity attached.
+func WithIdentity(ctx context.Context, id string, cfg IdentityConfig) context.Context {
+	return context.WithValue(ctx, identityContextKey{}, &CallerIdentity{
+		ID:     id,
+		Config: cfg,
+	})
+}
+
+// GetCallerIdentity extracts the caller identity from the context, if present.
+func GetCallerIdentity(ctx context.Context) *CallerIdentity {
+	if val, ok := ctx.Value(identityContextKey{}).(*CallerIdentity); ok {
+		return val
+	}
+	return nil
+}
+
 // RegisteredTool wraps a tool, its owning server name, configuration, and client.
 type RegisteredTool struct {
 	ServerName   string
@@ -43,14 +67,14 @@ type cacheEntry struct {
 
 // Metrics tracks runtime performance and usage statistics.
 type Metrics struct {
-	TotalCalls     uint64 `json:"total_calls"`
-	CacheHits      uint64 `json:"cache_hits"`
-	Errors         uint64 `json:"errors"`
-	ActiveUpstreams int   `json:"active_upstreams"`
-	IndexedTools   int    `json:"indexed_tools"`
+	TotalCalls      uint64 `json:"total_calls"`
+	CacheHits       uint64 `json:"cache_hits"`
+	Errors          uint64 `json:"errors"`
+	ActiveUpstreams int    `json:"active_upstreams"`
+	IndexedTools    int    `json:"indexed_tools"`
 }
 
-// Proxy manages upstream MCP clients, caching, security policies, and tool indexing.
+// Proxy manages upstream MCP clients, caching, identity RBAC, and tool indexing.
 type Proxy struct {
 	logger         *slog.Logger
 	defaultTimeout time.Duration
@@ -60,6 +84,7 @@ type Proxy struct {
 	tools         map[string]*RegisteredTool
 	serverConfigs map[string]ServerConfig
 	serverDescs   map[string]string
+	identities    map[string]IdentityConfig
 
 	cacheMu sync.RWMutex
 	cache   map[string]cacheEntry
@@ -81,12 +106,17 @@ func NewProxy(logger *slog.Logger, defaultTimeout time.Duration) *Proxy {
 		tools:          make(map[string]*RegisteredTool),
 		serverConfigs:  make(map[string]ServerConfig),
 		serverDescs:    make(map[string]string),
+		identities:     make(map[string]IdentityConfig),
 		cache:          make(map[string]cacheEntry),
 	}
 }
 
 // InitUpstreams connects to all configured upstream MCP servers concurrently and indexes their tools.
 func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
+	p.mu.Lock()
+	p.identities = cfg.Identities
+	p.mu.Unlock()
+
 	var wg sync.WaitGroup
 
 	for name, srv := range cfg.MCPServers {
@@ -178,7 +208,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
 		Name:    "mcp-search-proxy",
-		Version: "1.0.0",
+		Version: "1.1.0",
 	}
 
 	initResult, err := c.Initialize(initCtx, initReq)
@@ -223,6 +253,30 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	return c, nil
 }
 
+// ResolveIdentity looks up a configured identity by token, API key, or ID.
+func (p *Proxy) ResolveIdentity(tokenOrID string) (string, IdentityConfig, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if tokenOrID == "" {
+		return "", IdentityConfig{}, false
+	}
+
+	// Match by ID
+	if cfg, ok := p.identities[tokenOrID]; ok {
+		return tokenOrID, cfg, true
+	}
+
+	// Match by Token
+	for id, cfg := range p.identities {
+		if cfg.Token != "" && cfg.Token == tokenOrID {
+			return id, cfg, true
+		}
+	}
+
+	return "", IdentityConfig{}, false
+}
+
 // ReloadConfig dynamically reloads configuration and updates upstream servers in-flight.
 func (p *Proxy) ReloadConfig(ctx context.Context, cfg *Config) error {
 	p.logger.Info("reloading proxy configuration...")
@@ -246,26 +300,38 @@ func (p *Proxy) GetTool(toolName string) (mcp.Tool, string, bool) {
 	return reg.Tool, reg.ServerName, true
 }
 
-// ListServers returns a clean list of connected servers with tool counts and descriptions.
-func (p *Proxy) ListServers() []ServerInfo {
+// ListServers returns a clean list of connected servers filtered by caller identity.
+func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
+	ident := GetCallerIdentity(ctx)
 
 	counts := make(map[string]int)
 	for key, reg := range p.tools {
 		if !strings.Contains(key, ":") {
-			counts[reg.ServerName]++
+			// Check if tool is accessible to identity
+			if p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
+				counts[reg.ServerName]++
+			}
 		}
 	}
 
 	var servers []ServerInfo
 	for name := range p.clients {
+		if !p.isServerAccessible(ident, name) {
+			continue
+		}
 		cfg := p.serverConfigs[name]
+		ro := cfg.ReadOnly
+		if ident != nil && ident.Config.ReadOnly {
+			ro = true
+		}
 		servers = append(servers, ServerInfo{
 			Name:        name,
 			Description: p.serverDescs[name],
 			ToolCount:   counts[name],
-			ReadOnly:    cfg.ReadOnly,
+			ReadOnly:    ro,
 		})
 	}
 
@@ -297,10 +363,12 @@ func (p *Proxy) GetMetrics() Metrics {
 	}
 }
 
-// SearchToolsFormatConcise formats search results using weighted multi-field relevance scoring.
-func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
+// SearchToolsFormatConcise formats search results filtered by caller identity.
+func (p *Proxy) SearchToolsFormatConcise(ctx context.Context, query string, limit int) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
+	ident := GetCallerIdentity(ctx)
 
 	query = strings.TrimSpace(strings.ToLower(query))
 	rawTokens := strings.Fields(query)
@@ -323,6 +391,11 @@ func (p *Proxy) SearchToolsFormatConcise(query string, limit int) string {
 
 	for key, reg := range p.tools {
 		if strings.Contains(key, ":") {
+			continue
+		}
+
+		// Identity-Aware Filtering
+		if !p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
 			continue
 		}
 
@@ -443,7 +516,7 @@ func extractParamSignature(schema mcp.ToolInputSchema) string {
 	return strings.Join(parts, ", ")
 }
 
-// CallTool routes a tool call to the owning upstream client with timeouts, caching, and guardrail policies.
+// CallTool routes a tool call to the owning upstream client with timeouts, caching, identity RBAC, and backend user mapping.
 func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]any) (*mcp.CallToolResult, error) {
 	p.totalCalls.Add(1)
 
@@ -460,14 +533,51 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 		return nil, fmt.Errorf("tool %q not found across connected upstream servers", toolName)
 	}
 
-	// 1. Policy Enforcement & Guardrails
+	ident := GetCallerIdentity(ctx)
+
+	// 1. Identity RBAC Enforcement
+	if ident != nil {
+		if !p.isServerAccessible(ident, reg.ServerName) {
+			p.errors.Add(1)
+			return nil, fmt.Errorf("access denied: caller %q is not authorized to access server %q", ident.ID, reg.ServerName)
+		}
+		if !p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
+			p.errors.Add(1)
+			return nil, fmt.Errorf("access denied: caller %q is not authorized to execute tool %q", ident.ID, reg.Tool.Name)
+		}
+		if ident.Config.ReadOnly {
+			if p.isDestructiveTool(reg.Tool.Name) {
+				p.errors.Add(1)
+				return nil, fmt.Errorf("access denied: caller %q is in read_only mode; mutating tool %q blocked", ident.ID, reg.Tool.Name)
+			}
+		}
+
+		// 2. Dynamic Backend Identity Mapping (Caller Identity -> Backend User/Account)
+		if ident.Config.UpstreamUserMap != nil {
+			if backendUser, mapped := ident.Config.UpstreamUserMap[reg.ServerName]; mapped && backendUser != "" {
+				if args == nil {
+					args = make(map[string]any)
+				}
+				// Automatically bind backend identity to common account/user fields if not overridden
+				if _, hasAccount := args["account"]; !hasAccount {
+					args["account"] = backendUser
+				}
+				if _, hasUser := args["user"]; !hasUser {
+					args["user"] = backendUser
+				}
+				p.logger.Debug("mapped caller identity to upstream user", "caller", ident.ID, "server", reg.ServerName, "backend_user", backendUser)
+			}
+		}
+	}
+
+	// 3. Server-Level Policy Enforcement & Guardrails
 	if err := p.enforcePolicy(reg, args); err != nil {
 		p.errors.Add(1)
 		p.logger.Warn("tool call blocked by policy", "tool", toolName, "server", reg.ServerName, "err", err)
 		return nil, err
 	}
 
-	// 2. Cache Lookup
+	// 4. Cache Lookup
 	cacheKey := ""
 	cacheTTL := reg.ServerConfig.GetCacheTTL()
 	if cacheTTL > 0 {
@@ -483,7 +593,7 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 		}
 	}
 
-	// 3. Execution with Bounded Timeout
+	// 5. Execution with Bounded Timeout
 	timeout := reg.ServerConfig.GetTimeout(p.defaultTimeout)
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -495,7 +605,7 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	p.logger.Info("forwarding call to upstream", "server", reg.ServerName, "tool", reg.Tool.Name, "timeout", timeout)
 	res, err := reg.Client.CallTool(execCtx, req)
 
-	// 4. Auto-Reconnect Recovery on Broken Pipe
+	// 6. Auto-Reconnect Recovery on Broken Pipe
 	if err != nil && (strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "transport closed") || strings.Contains(err.Error(), "EOF")) {
 		p.logger.Warn("upstream connection severed, attempting automatic reconnection", "server", reg.ServerName)
 		newClient, reconnErr := p.initSingleUpstream(ctx, reg.ServerName, reg.ServerConfig)
@@ -513,7 +623,7 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 		return nil, err
 	}
 
-	// 5. Store in Cache if configured and successful
+	// 7. Store in Cache if configured and successful
 	if cacheKey != "" && res != nil && !res.IsError {
 		p.cacheMu.Lock()
 		p.cache[cacheKey] = cacheEntry{
@@ -526,21 +636,67 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	return res, nil
 }
 
+func (p *Proxy) isServerAccessible(ident *CallerIdentity, serverName string) bool {
+	if ident == nil || len(ident.Config.AllowedServers) == 0 {
+		return true
+	}
+	for _, s := range ident.Config.AllowedServers {
+		if s == "*" || s == serverName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxy) isToolAccessible(ident *CallerIdentity, serverName, toolName string) bool {
+	if ident == nil {
+		return true
+	}
+	if !p.isServerAccessible(ident, serverName) {
+		return false
+	}
+	// Blacklist check
+	for _, pattern := range ident.Config.BlockedTools {
+		matched, _ := filepath.Match(pattern, toolName)
+		if matched || pattern == toolName {
+			return false
+		}
+	}
+	// Whitelist check
+	if len(ident.Config.AllowedTools) > 0 {
+		allowed := false
+		for _, pattern := range ident.Config.AllowedTools {
+			matched, _ := filepath.Match(pattern, toolName)
+			if matched || pattern == toolName || pattern == "*" {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Proxy) isDestructiveTool(toolName string) bool {
+	nameLower := strings.ToLower(toolName)
+	verbs := []string{"create", "delete", "drop", "update", "write", "set", "remove", "kill", "post", "put", "modify", "clear"}
+	for _, verb := range verbs {
+		if strings.HasPrefix(nameLower, verb) || strings.Contains(nameLower, "_"+verb) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Proxy) enforcePolicy(reg *RegisteredTool, args map[string]any) error {
 	cfg := reg.ServerConfig
 
-	// Read-Only Enforcement
-	if cfg.ReadOnly {
-		nameLower := strings.ToLower(reg.Tool.Name)
-		destructiveVerbs := []string{"create", "delete", "drop", "update", "write", "set", "remove", "kill", "post", "put", "modify", "clear"}
-		for _, verb := range destructiveVerbs {
-			if strings.HasPrefix(nameLower, verb) || strings.Contains(nameLower, "_"+verb) {
-				return fmt.Errorf("security policy: server %q is configured in read_only mode; tool %q is blocked", reg.ServerName, reg.Tool.Name)
-			}
-		}
+	if cfg.ReadOnly && p.isDestructiveTool(reg.Tool.Name) {
+		return fmt.Errorf("security policy: server %q is configured in read_only mode; tool %q is blocked", reg.ServerName, reg.Tool.Name)
 	}
 
-	// Blacklist Check
 	for _, pattern := range cfg.BlockedTools {
 		matched, _ := filepath.Match(pattern, reg.Tool.Name)
 		if matched || pattern == reg.Tool.Name {
@@ -548,12 +704,11 @@ func (p *Proxy) enforcePolicy(reg *RegisteredTool, args map[string]any) error {
 		}
 	}
 
-	// Whitelist Check
 	if len(cfg.AllowedTools) > 0 {
 		allowed := false
 		for _, pattern := range cfg.AllowedTools {
 			matched, _ := filepath.Match(pattern, reg.Tool.Name)
-			if matched || pattern == reg.Tool.Name {
+			if matched || pattern == reg.Tool.Name || pattern == "*" {
 				allowed = true
 				break
 			}

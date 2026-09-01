@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 func TestSearchToolsFormatConcise(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	p := NewProxy(logger, 5*time.Second)
+	ctx := context.Background()
 
 	p.serverDescs["database"] = "Relational SQL database queries and analytics"
 	p.tools["query_sql"] = &RegisteredTool{
@@ -40,19 +42,19 @@ func TestSearchToolsFormatConcise(t *testing.T) {
 	}
 
 	// Search for "sql"
-	res := p.SearchToolsFormatConcise("sql", 5)
+	res := p.SearchToolsFormatConcise(ctx, "sql", 5)
 	if !contains(res, "query_sql") {
 		t.Fatalf("expected query_sql in search result, got: %s", res)
 	}
 
 	// Search by server description "relational"
-	resRel := p.SearchToolsFormatConcise("relational", 5)
+	resRel := p.SearchToolsFormatConcise(ctx, "relational", 5)
 	if !contains(resRel, "query_sql") {
 		t.Fatalf("expected query_sql when searching for server description 'relational', got: %s", resRel)
 	}
 
 	// Wildcard search
-	resAll := p.SearchToolsFormatConcise("*", 5)
+	resAll := p.SearchToolsFormatConcise(ctx, "*", 5)
 	if !contains(resAll, "query_sql") || !contains(resAll, "create_issue") {
 		t.Fatalf("expected all tools in wildcard search, got: %s", resAll)
 	}
@@ -92,6 +94,44 @@ func TestSecurityPolicies(t *testing.T) {
 	errBL := p.enforcePolicy(regBlacklist, nil)
 	if errBL == nil {
 		t.Fatal("expected policy rejection for blacklisted tool drop_database")
+	}
+}
+
+func TestIdentityRBAC(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	p := NewProxy(logger, 5*time.Second)
+
+	p.serverDescs["github"] = "GitHub repos and PRs"
+	p.tools["create_pr"] = &RegisteredTool{
+		ServerName: "github",
+		Tool: mcp.Tool{Name: "create_pr"},
+	}
+
+	p.serverDescs["orders"] = "Shopping orders"
+	p.clients["github"] = nil; p.clients["orders"] = nil; p.tools["get_orders"] = &RegisteredTool{
+		ServerName: "orders",
+		Tool: mcp.Tool{Name: "get_orders"},
+	}
+
+	// 1. Restricted Identity: only allowed "orders"
+	ctxRestricted := WithIdentity(context.Background(), "restricted-agent", IdentityConfig{
+		AllowedServers: []string{"orders"},
+		ReadOnly:       true,
+	})
+
+	// Check ListServers filtering
+	servers := p.ListServers(ctxRestricted)
+	if len(servers) != 1 || servers[0].Name != "orders" {
+		t.Fatalf("expected only 'orders' server for restricted identity, got: %v", servers)
+	}
+
+	// Check SearchTools filtering: should find get_orders, but NOT create_pr
+	searchRes := p.SearchToolsFormatConcise(ctxRestricted, "*", 10)
+	if contains(searchRes, "create_pr") {
+		t.Fatalf("restricted identity should NOT see create_pr in search results")
+	}
+	if !contains(searchRes, "get_orders") {
+		t.Fatalf("restricted identity SHOULD see get_orders")
 	}
 }
 
