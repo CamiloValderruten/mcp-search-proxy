@@ -75,7 +75,7 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 
 ### 🔐 Enterprise Security & Identity
 - 🔑 **Identity-Aware RBAC**: Define client tokens mapped to whitelisted servers, permitted tools, and read-only flags. Mask unauthorized tools so agents never even see them.
-- 🔄 **Dynamic Credential Brokering**: Transparently swap upstream authentication headers per caller identity. Camilo queries Hindsight with Camilo's token; Juliana queries with Juliana's token.
+- 🔄 **Dynamic Credential Brokering**: Transparently swap upstream authentication headers per caller identity. Alice queries GitHub with Alice's personal access token; Bob queries with Bob's token.
 - 👤 **Backend Identity Mapping**: Dynamically inject mapped backend accounts (`args["account"] = "alice"`) to prevent prompt injection and account spoofing.
 - 🔐 **Pluggable Secret Resolution**: Zero plaintext secrets in config files! Resolves `op://` (1Password CLI via headless Service Account), `env://` (Environment variables), and `file://` (Mounted filesystem secrets).
 - 🛡️ **Execution Guardrails**: Enforce `read_only: true` on production databases, blacklist dangerous verbs (`drop_*`, `delete_*`), or enforce strict whitelist globs.
@@ -138,14 +138,14 @@ Never store raw API keys in configuration files or Git repositories. `mcp-search
 ```json
 {
   "embeddings": {
-    "apiKey": "op://MCP Gateway/OpenAI/credential"
+    "apiKey": "op://Production/OpenAI/credential"
   },
   "mcpServers": {
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "op://MCP Gateway/GitHub/token"
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "op://Production/GitHub/token"
       }
     }
   }
@@ -161,16 +161,21 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 ```json
 {
   "identities": {
-    "camilo": {
-      "token": "camilo-secret-token",
-      "allowed_servers": ["*"]
-    },
-    "juliana": {
-      "token": "juliana-secret-token",
-      "allowed_servers": ["home-assistant", "huckleberry", "orders"],
+    "developer-alice": {
+      "token": "alice-secret-token",
+      "allowed_servers": ["*"],
       "upstream_headers": {
-        "hindsight": {
-          "Authorization": "Bearer op://MCP Gateway/Juliana_Hindsight/token"
+        "remote-gateway": {
+          "Authorization": "Bearer op://Production/Enterprise/alice_token"
+        }
+      }
+    },
+    "developer-bob": {
+      "token": "bob-secret-token",
+      "allowed_servers": ["github", "slack"],
+      "upstream_headers": {
+        "github": {
+          "Authorization": "Bearer env://BOB_GITHUB_TOKEN"
         }
       }
     },
@@ -186,7 +191,7 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 
 ### How Identity Works:
 1. **Dynamic Tool Masking**: When `guest-agent` calls `search_tools` or `list_servers`, the proxy filters out unapproved servers and destructive tools. The agent never even sees them!
-2. **Dynamic Credential Swapping**: When `juliana` calls `hindsight`, the proxy transparently attaches her personal Bearer token from 1Password.
+2. **Dynamic Credential Swapping**: When `developer-alice` calls `remote-gateway`, the proxy transparently attaches her personal Bearer token from 1Password.
 3. **Zero Secret Exposure**: Outbound headers are injected ephemerally at the network boundary. Neither the client IDE nor the LLM agent ever sees the raw secrets.
 4. **Completely Optional**: Omit the `identities` block to run an open, unauthenticated gateway.
 
@@ -209,14 +214,14 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 1. At boot, the proxy embeds all tools in a single batch API call (~2.5s) and caches the 1536-dimensional float vectors in RAM.
 2. The user or agent asks a natural language question:
    ```
-   search_tools(query="how is the baby sleeping?")
+   search_tools(query="how do I see user signups this week?")
    ```
 3. Cosine similarity matches concepts to functions with confidence scores:
    ```
-   Found 9 matching tools via semantic search (showing top 3):
-   - hb_list_sleep(child_uid?, end?, last_hours?, start?) [sim: 0.38]
-   - hb_list_pumps(child_uid?, end?, last_hours?, start?) [sim: 0.32]
-   - hb_list_feeds(child_uid?, end?, last_hours?, start?) [sim: 0.31]
+   Found 8 matching tools via semantic search (showing top 3):
+   - query_users_by_date(table, start_date, end_date) [sim: 0.42] (postgres-analytics)
+   - get_analytics_metrics(metric_name, timeframe) [sim: 0.39] (datadog)
+   - list_team_activity(team_id, timeframe) [sim: 0.35] (slack)
    ```
 
 ---
@@ -231,13 +236,18 @@ Create an `mcp_servers.json` configuration file defining your upstream servers:
     "defaultTimeout": "30s"
   },
   "embeddings": {
-    "apiKey": "op://MCP Gateway/OpenAI/credential",
+    "apiKey": "op://Production/OpenAI/credential",
     "model": "text-embedding-3-small"
   },
   "mcpServers": {
-    "home-assistant": {
-      "url": "http://127.0.0.1:8086/mcp",
-      "description": "Smart home control: lights, switches, climate, sensors, and scenes."
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "op://Production/GitHub/token"
+      },
+      "description": "GitHub repository management: issues, pull requests, commits, branches, and code search.",
+      "timeout": "45s"
     },
     "postgres-analytics": {
       "command": "npx",
@@ -291,7 +301,7 @@ Connect via HTTP to the running daemon:
     "search-proxy": {
       "url": "http://127.0.0.1:8080/mcp",
       "headers": {
-        "Authorization": "Bearer camilo-secret-token"
+        "Authorization": "Bearer alice-secret-token"
       }
     }
   }
