@@ -145,7 +145,11 @@ func main() {
 			if srv.ReadOnly {
 				roFlag = " `[read-only]`"
 			}
-			sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
+			if srv.Status == "error" {
+				sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+			} else {
+				sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
+			}
 		}
 		return mcp.NewToolResultText(sb.String()), nil
 	})
@@ -259,10 +263,15 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			m := proxy.GetMetrics()
 			w.Header().Set("Content-Type", "application/json")
+			status := "ok"
+			if m.FailedUpstreams > 0 {
+				status = "degraded"
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status":           "ok",
+				"status":           status,
 				"version":          version,
 				"active_upstreams": m.ActiveUpstreams,
+				"failed_upstreams": m.FailedUpstreams,
 				"indexed_tools":    m.IndexedTools,
 			})
 		})

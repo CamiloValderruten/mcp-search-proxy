@@ -58,6 +58,8 @@ type ServerInfo struct {
 	Description string `json:"description,omitempty"`
 	ToolCount   int    `json:"tool_count"`
 	ReadOnly    bool   `json:"read_only,omitempty"`
+	Status      string `json:"status,omitempty"` // "ok" or "error"
+	Error       string `json:"error,omitempty"`  // error message if failed
 }
 
 type cacheEntry struct {
@@ -71,6 +73,7 @@ type Metrics struct {
 	CacheHits       uint64 `json:"cache_hits"`
 	Errors          uint64 `json:"errors"`
 	ActiveUpstreams int    `json:"active_upstreams"`
+	FailedUpstreams int    `json:"failed_upstreams"`
 	IndexedTools    int    `json:"indexed_tools"`
 	SemanticEnabled bool   `json:"semantic_enabled"`
 }
@@ -85,6 +88,7 @@ type Proxy struct {
 	tools         map[string]*RegisteredTool
 	serverConfigs map[string]ServerConfig
 	serverDescs   map[string]string
+	serverErrors  map[string]string
 	identities    map[string]IdentityConfig
 
 	cacheMu sync.RWMutex
@@ -113,6 +117,7 @@ func NewProxy(logger *slog.Logger, defaultTimeout time.Duration) *Proxy {
 		tools:          make(map[string]*RegisteredTool),
 		serverConfigs:  make(map[string]ServerConfig),
 		serverDescs:    make(map[string]string),
+		serverErrors:   make(map[string]string),
 		identities:     make(map[string]IdentityConfig),
 		cache:          make(map[string]cacheEntry),
 		toolVectors:    make(map[string][]float32),
@@ -301,6 +306,10 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	cancel()
 	if err != nil {
 		p.logger.Error("failed to initialize upstream server", "server", name, "err", err)
+		p.mu.Lock()
+		p.serverErrors[name] = err.Error()
+		delete(p.clients, name)
+		p.mu.Unlock()
 		_ = c.Close()
 		return nil, err
 	}
@@ -316,11 +325,16 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 	cancelList()
 	if err != nil {
 		p.logger.Error("failed to list tools from upstream", "server", name, "err", err)
+		p.mu.Lock()
+		p.serverErrors[name] = err.Error()
+		delete(p.clients, name)
+		p.mu.Unlock()
 		_ = c.Close()
 		return nil, err
 	}
 
 	p.mu.Lock()
+	delete(p.serverErrors, name)
 	p.clients[name] = c
 	for _, tool := range toolsResult.Tools {
 		reg := &RegisteredTool{
@@ -400,8 +414,16 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 		}
 	}
 
-	var servers []ServerInfo
+	allServers := make(map[string]bool)
+	for name := range p.serverConfigs {
+		allServers[name] = true
+	}
 	for name := range p.clients {
+		allServers[name] = true
+	}
+
+	var servers []ServerInfo
+	for name := range allServers {
 		if !p.isServerAccessible(ident, name) {
 			continue
 		}
@@ -410,11 +432,19 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 		if ident != nil && ident.Config.ReadOnly {
 			ro = true
 		}
+		status := "ok"
+		errMsg := ""
+		if errStr, isErr := p.serverErrors[name]; isErr {
+			status = "error"
+			errMsg = errStr
+		}
 		servers = append(servers, ServerInfo{
 			Name:        name,
 			Description: p.serverDescs[name],
 			ToolCount:   counts[name],
 			ReadOnly:    ro,
+			Status:      status,
+			Error:       errMsg,
 		})
 	}
 
@@ -429,6 +459,7 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 func (p *Proxy) GetMetrics() Metrics {
 	p.mu.RLock()
 	activeUpstreams := len(p.clients)
+	failedUpstreams := len(p.serverErrors)
 	toolCount := 0
 	for k := range p.tools {
 		if !strings.Contains(k, ":") {
@@ -446,6 +477,7 @@ func (p *Proxy) GetMetrics() Metrics {
 		CacheHits:       p.cacheHits.Load(),
 		Errors:          p.errors.Load(),
 		ActiveUpstreams: activeUpstreams,
+		FailedUpstreams: failedUpstreams,
 		IndexedTools:    toolCount,
 		SemanticEnabled: semanticEnabled,
 	}
