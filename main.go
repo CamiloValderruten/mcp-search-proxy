@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,7 +16,19 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
+
+type jsonRPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type toolCallParams struct {
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments"`
+}
 
 func main() {
 	configPath := flag.String("config", "", "Path to MCP servers configuration JSON file")
@@ -37,7 +51,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Logging goes to stderr so stdout remains clean for MCP JSON-RPC
 	var level slog.Level
 	switch *logLevel {
 	case "debug":
@@ -76,7 +89,6 @@ func main() {
 		logger.Error("failed to initialize upstreams", "err", err)
 	}
 
-	// Create MCP server
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
@@ -86,8 +98,8 @@ func main() {
 	// Tool 1: search_tools
 	searchTool := mcp.NewTool(
 		"search_tools",
-		mcp.WithDescription("Search for available tools across upstream MCP servers. Returns tool names, descriptions, and input schemas matching your query. Use this first to discover capabilities."),
-		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing the tool or capability you are looking for (e.g. 'email', 'nursery temperature', 'orders', 'diapers', or '*' for all).")),
+		mcp.WithDescription("Search for available tools across upstream MCP servers. Returns tool names, signatures, and descriptions."),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'email', 'nursery temperature', 'orders', 'diapers', or '*' for all).")),
 	)
 
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -95,26 +107,15 @@ func main() {
 		if err != nil {
 			return mcp.NewToolResultError("missing required string parameter 'query'"), nil
 		}
-
-		results := proxy.SearchTools(query)
-		data, err := json.MarshalIndent(results, "", "  ")
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("failed to serialize search results: %v", err)), nil
-		}
-
-		if len(results) == 0 {
-			return mcp.NewToolResultText(fmt.Sprintf("No tools found matching query %q. Try broader keywords or '*' to list all.", query)), nil
-		}
-
-		return mcp.NewToolResultText(string(data)), nil
+		summary := proxy.SearchToolsFormatConcise(query, 8)
+		return mcp.NewToolResultText(summary), nil
 	})
 
-	// Tool 2: call_tool
+	// Tool 2: call_tool (relaxed & forgiving)
 	callTool := mcp.NewTool(
 		"call_tool",
-		mcp.WithDescription("Execute any discovered tool through the proxy by name. Pass the tool's required parameters in the arguments object."),
-		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to invoke (discovered via search_tools).")),
-		mcp.WithObject("arguments", mcp.Description("Key-value map of arguments to pass to the target tool.")),
+		mcp.WithDescription("Execute any tool on upstream servers by name. Accepts arguments either nested under 'arguments' or at top-level."),
+		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke.")),
 	)
 
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -124,26 +125,103 @@ func main() {
 		}
 
 		args := request.GetArguments()
-		// If nested under "arguments", extract it
+		// If arguments are nested under "arguments", extract it
 		if nested, ok := args["arguments"].(map[string]any); ok {
 			args = nested
 		} else {
-			// Remove tool_name from args map before forwarding
+			// Otherwise treat remaining top-level keys as the arguments
 			delete(args, "tool_name")
 		}
 
 		res, err := proxy.CallTool(ctx, toolName, args)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("error executing %q on upstream: %v", toolName, err)), nil
+			return mcp.NewToolResultError(err.Error()), nil
 		}
-
 		return res, nil
 	})
 
-	logger.Info("starting stdio server for mcp-search-proxy")
-	stdioServer := server.NewStdioServer(s)
-	if err := stdioServer.Listen(ctx, os.Stdin, os.Stdout); err != nil {
-		logger.Error("stdio server error", "err", err)
-		os.Exit(1)
+	// Tool 3: describe_tool (optional schema inspection)
+	describeTool := mcp.NewTool(
+		"describe_tool",
+		mcp.WithDescription("Get the detailed input schema and parameter descriptions for a single tool."),
+		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
+	)
+
+	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		toolName, err := request.RequireString("tool_name")
+		if err != nil {
+			return mcp.NewToolResultError("missing parameter 'tool_name'"), nil
+		}
+
+		toolDef, srv, ok := proxy.GetTool(toolName)
+		if !ok {
+			return mcp.NewToolResultError(fmt.Sprintf("tool %q not found", toolName)), nil
+		}
+
+		data, _ := json.MarshalIndent(map[string]any{
+			"server":      srv,
+			"name":        toolDef.Name,
+			"description": toolDef.Description,
+			"inputSchema": toolDef.InputSchema,
+		}, "", "  ")
+
+		return mcp.NewToolResultText(string(data)), nil
+	})
+
+	logger.Info("starting stdio server loop for mcp-search-proxy")
+
+	// Custom stdio loop: supports standard MCP server handling AND direct tool passthrough!
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			logger.Error("error reading stdin", "err", err)
+			break
+		}
+
+		var rpcReq jsonRPCRequest
+		if err := json.Unmarshal(line, &rpcReq); err != nil {
+			continue
+		}
+
+		// Direct tool execution passthrough
+		if rpcReq.Method == "tools/call" && rpcReq.Params != nil {
+			var tp toolCallParams
+			if err := json.Unmarshal(rpcReq.Params, &tp); err == nil {
+				// If it's NOT a built-in proxy tool, but IS an upstream tool, execute it directly!
+				if tp.Name != "search_tools" && tp.Name != "call_tool" && tp.Name != "describe_tool" {
+					if proxy.HasTool(tp.Name) {
+						logger.Info("transparent direct passthrough execution", "tool", tp.Name)
+						callRes, callErr := proxy.CallTool(ctx, tp.Name, tp.Arguments)
+						if callErr != nil {
+							callRes = mcp.NewToolResultError(callErr.Error())
+						}
+
+						respMap := map[string]any{
+							"jsonrpc": "2.0",
+							"id":      rpcReq.ID,
+							"result":  callRes,
+						}
+						respBytes, _ := json.Marshal(respMap)
+						respBytes = append(respBytes, '\n')
+						_, _ = os.Stdout.Write(respBytes)
+						continue
+					}
+				}
+			}
+		}
+
+		// Otherwise let the standard MCP server handle it (initialize, tools/list, search_tools, etc.)
+		resp := s.HandleMessage(ctx, line)
+		if resp != nil {
+			respBytes, err := json.Marshal(resp)
+			if err == nil {
+				respBytes = append(respBytes, '\n')
+				_, _ = os.Stdout.Write(respBytes)
+			}
+		}
 	}
 }
