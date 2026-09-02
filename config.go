@@ -60,8 +60,7 @@ func (s *ServerConfig) GetCacheTTL() time.Duration {
 
 // IdentityConfig defines RBAC, upstream identity mappings, and dynamic credentials for a caller client.
 type IdentityConfig struct {
-	Email           string                       `json:"email,omitempty"`             // Primary Google OAuth user email
-	Emails          []string                     `json:"emails,omitempty"`            // Multiple allowed emails/aliases
+	Emails          []string                     `json:"emails,omitempty"`            // Whitelist of allowed emails/aliases
 	Token           string                       `json:"token,omitempty"`             // Bearer token for HTTP auth
 	AllowedServers  []string                     `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
 	AllowedTools    []string                     `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")
@@ -71,13 +70,10 @@ type IdentityConfig struct {
 	UpstreamHeaders map[string]map[string]string `json:"upstream_headers,omitempty"`  // Map upstream server -> headers with secret URIs (e.g. op://, env://)
 }
 
-// MatchesEmail checks if a given email matches the identity's configured email or aliases.
+// MatchesEmail checks if a given email matches the identity's configured emails or identity key.
 func (c IdentityConfig) MatchesEmail(id, email string) bool {
 	if email == "" {
 		return false
-	}
-	if c.Email != "" && strings.EqualFold(c.Email, email) {
-		return true
 	}
 	for _, e := range c.Emails {
 		if strings.EqualFold(e, email) {
