@@ -133,6 +133,10 @@ func main() {
 		mcp.WithDescription("List all connected upstream MCP servers, descriptions, tool counts, and security policies accessible to your identity."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
+			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nPlease sign in with Google to view your servers and tools:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
+		}
+
 		servers := proxy.ListServers(ctx)
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Connected Upstream Servers (%d):\n\n", len(servers)))
@@ -161,6 +165,10 @@ func main() {
 		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
+			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nPlease sign in with Google to search and run tools:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
+		}
+
 		query, err := request.RequireString("query")
 		if err != nil {
 			return mcp.NewToolResultError("missing required parameter 'query'"), nil
@@ -176,6 +184,10 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Please sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
+		}
+
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
 			return mcp.NewToolResultError("missing required parameter 'tool_name'"), nil
@@ -202,6 +214,9 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
 	)
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Please sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
+		}
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
 			return mcp.NewToolResultError("missing parameter 'tool_name'"), nil
@@ -326,23 +341,15 @@ func main() {
 						}
 					}
 					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
-					mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
-					return
-				}
-
-				// If not authenticated via Google, check if request has a valid non-empty identity token
-				if token != "" {
+				} else if token != "" {
 					if id, identCfg, ok := proxy.ResolveIdentity(token); ok && identCfg.Token != "" {
 						reqCtx = WithIdentity(reqCtx, id, identCfg)
-						mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
-						return
 					}
 				}
-
-				// Strictly reject unauthenticated requests
-				w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/.well-known/oauth-protected-resource\"", cfg.Settings.PublicURL))
-				http.Error(w, fmt.Sprintf("Unauthorized: Please sign in with Google at %s/auth/login", cfg.Settings.PublicURL), http.StatusUnauthorized)
-				return
+			} else if token != "" {
+				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
+					reqCtx = WithIdentity(reqCtx, id, identCfg)
+				}
 			}
 
 			mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
