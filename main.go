@@ -134,7 +134,7 @@ func main() {
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nPlease sign in with Google to view your servers and tools:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
 		}
 
 		servers := proxy.ListServers(ctx)
@@ -166,7 +166,7 @@ func main() {
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nPlease sign in with Google to search and run tools:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
 		}
 
 		query, err := request.RequireString("query")
@@ -185,7 +185,7 @@ func main() {
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Please sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
 		}
 
 		toolName, err := request.RequireString("tool_name")
@@ -215,7 +215,7 @@ func main() {
 	)
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Please sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
 		}
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
