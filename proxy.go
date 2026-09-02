@@ -169,6 +169,15 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 		} else {
 			p.oauthMgr.UpdateServers(cfg.MCPServers)
 		}
+		p.oauthMgr.OnAuthorized = func(serverName string) {
+			p.mu.RLock()
+			srv, ok := p.serverConfigs[serverName]
+			p.mu.RUnlock()
+			if ok {
+				p.logger.Info("re-indexing upstream server following oauth authorization", "server", serverName)
+				_, _ = p.initSingleUpstream(context.Background(), serverName, srv)
+			}
+		}
 	}
 
 	var wg sync.WaitGroup

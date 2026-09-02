@@ -48,6 +48,8 @@ type OAuthManager struct {
 
 	discoveredMu sync.RWMutex
 	discovered   map[string]*DiscoveredOAuth
+
+	OnAuthorized func(serverName string)
 }
 
 // DiscoveredOAuth holds dynamically discovered OAuth2 endpoints from an upstream MCP server.
@@ -521,6 +523,9 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m.logger.Info("successfully stored oauth tokens for user and server", "user", st.Caller, "server", st.Server)
+	if m.OnAuthorized != nil {
+		go m.OnAuthorized(st.Server)
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
