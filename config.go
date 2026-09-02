@@ -59,6 +59,7 @@ func (s *ServerConfig) GetCacheTTL() time.Duration {
 
 // IdentityConfig defines RBAC, upstream identity mappings, and dynamic credentials for a caller client.
 type IdentityConfig struct {
+	Email           string                       `json:"email,omitempty"`             // Google OAuth user email
 	Token           string                       `json:"token,omitempty"`             // Bearer token for HTTP auth
 	AllowedServers  []string                     `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
 	AllowedTools    []string                     `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")

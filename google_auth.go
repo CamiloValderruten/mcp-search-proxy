@@ -291,15 +291,24 @@ func (h *GoogleAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *GoogleAuthHandler) isEmailAllowed(email string) bool {
-	if len(h.cfg.AllowedUsers) == 0 {
-		return true
+	if len(h.cfg.AllowedUsers) > 0 {
+		for _, allowed := range h.cfg.AllowedUsers {
+			if allowed == "*" || strings.EqualFold(allowed, email) {
+				return true
+			}
+		}
+		return false
 	}
-	for _, allowed := range h.cfg.AllowedUsers {
-		if allowed == "*" || strings.EqualFold(allowed, email) {
-			return true
+	if h.proxy != nil {
+		h.proxy.mu.RLock()
+		defer h.proxy.mu.RUnlock()
+		for id, ident := range h.proxy.identities {
+			if (ident.Email != "" && strings.EqualFold(ident.Email, email)) || strings.EqualFold(id, email) || strings.HasPrefix(strings.ToLower(email), strings.ToLower(id)) {
+				return true
+			}
 		}
 	}
-	return false
+	return true
 }
 
 // AuthenticateRequest checks for an active Google session cookie or bearer token.

@@ -319,7 +319,7 @@ func main() {
 					callerID := userEmail
 					var identCfg IdentityConfig
 					for id, c := range cfg.Identities {
-						if strings.EqualFold(id, userEmail) || strings.HasPrefix(strings.ToLower(userEmail), strings.ToLower(id)) {
+						if (c.Email != "" && strings.EqualFold(c.Email, userEmail)) || strings.EqualFold(id, userEmail) || strings.HasPrefix(strings.ToLower(userEmail), strings.ToLower(id)) {
 							callerID = id
 							identCfg = c
 							break
@@ -343,8 +343,9 @@ func main() {
 				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
 					reqCtx = WithIdentity(reqCtx, id, identCfg)
 				}
-			} else if googleAuthHandler != nil && cfg.Settings.AuthKey == "" && len(cfg.Identities) > 0 {
-				http.Error(w, "Unauthorized: Please authenticate via Google at /auth/login", http.StatusUnauthorized)
+			} else if googleAuthHandler != nil {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/.well-known/oauth-protected-resource\"", cfg.Settings.PublicURL))
+				http.Error(w, fmt.Sprintf("Unauthorized: Please sign in with Google at %s/auth/login", cfg.Settings.PublicURL), http.StatusUnauthorized)
 				return
 			}
 
