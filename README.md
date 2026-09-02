@@ -197,6 +197,49 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 
 ---
 
+## 🔐 OAuth 2.0 Upstream Delegation & Encrypted Token Vault
+
+When backends require individual user OAuth authorization (e.g. GitHub, Google Workspace, Slack), `mcp-search-proxy` acts as an encrypted credential broker:
+
+```json
+{
+  "settings": {
+    "publicUrl": "http://localhost:8080",
+    "vaultPath": "~/.config/mcp-search-proxy/vault.enc"
+  },
+  "mcpServers": {
+    "github": {
+      "url": "https://mcp.github.com/mcp",
+      "auth_type": "oauth2_pkce_per_user",
+      "oauth2": {
+        "client_id": "op://Production/GitHubOAuth/client_id",
+        "client_secret": "op://Production/GitHubOAuth/client_secret",
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "scopes": ["repo", "read:user"]
+      }
+    }
+  }
+}
+```
+
+### How Upstream OAuth Works:
+1. **Zero Database Needed**: Stores tokens encrypted at rest with AES-256-GCM in `vault.enc`. Microsecond RAM lookups with atomic write-back.
+2. **Actionable Consent Links**: If an agent attempts to invoke a tool on an unlinked server, the proxy returns a direct link:
+   ```
+   Authentication required: Please connect your account by opening:
+   http://localhost:8080/oauth/connect/github?caller=camilo
+   ```
+3. **Browser PKCE Flow**: The user clicks the link, approves access on the 3rd-party service, and is redirected back to `/oauth/callback/{server}` where the proxy captures and securely vaults the tokens.
+4. **Silent Background Token Refresh**: When an access token expires, the proxy automatically exchanges the `refresh_token` against the provider's `/token` endpoint before forwarding the tool request.
+5. **Endpoints**:
+   * `GET /oauth/connect/{server}`: Initiates authorization flow
+   * `GET /oauth/callback/{server}`: Handles redirect and stores credentials
+   * `GET /oauth/status?user={id}`: Returns connection statuses (ready for Admin Web UI)
+   * `POST /oauth/disconnect/{server}`: Revokes/deletes stored credentials
+
+---
+
 ## 🧠 Neural Semantic Vector Search
 
 `mcp-search-proxy` works out of the box with instant lexical search. For natural conversational discovery, enable neural vector search via any OpenAI-compatible `/v1/embeddings` endpoint (OpenAI, Ollama, LM Studio, vLLM):

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -165,6 +166,66 @@ func TestEnvVarExpansion(t *testing.T) {
 	}
 }
 
+func TestOAuthToolAuthorization(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	p := NewProxy(logger, 5*time.Second)
+
+	tmpDir, err := os.MkdirTemp("", "oauth_proxy_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	vaultStore, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-12345")
+	p.SetTokenStore(vaultStore)
+
+	oauthMgr := NewOAuthManager(vaultStore, p.secretMgr, "http://localhost:8080", map[string]ServerConfig{
+		"oauth-server": {
+			AuthType: "oauth2_pkce_per_user",
+			OAuth2: &OAuthServerConfig{
+				ClientID: "cid",
+				AuthURL:  "http://auth.example.com",
+				TokenURL: "http://token.example.com",
+			},
+		},
+	}, logger)
+	p.SetOAuthManager(oauthMgr)
+
+	p.tools["fetch_data"] = &RegisteredTool{
+		ServerName: "oauth-server",
+		Tool:       mcp.Tool{Name: "fetch_data"},
+		ServerConfig: ServerConfig{
+			AuthType: "oauth2_pkce_per_user",
+		},
+	}
+
+	ctx := WithIdentity(context.Background(), "alice", IdentityConfig{
+		AllowedServers: []string{"oauth-server"},
+	})
+
+	// 1. Call without token must fail with clear actionable connect URL
+	_, callErr := p.CallTool(ctx, "fetch_data", nil)
+	if callErr == nil {
+		t.Fatal("expected error for unauthenticated oauth server, got nil")
+	}
+	if !contains(callErr.Error(), "authentication required") || !contains(callErr.Error(), "http://localhost:8080/oauth/connect/oauth-server?caller=alice") {
+		t.Fatalf("expected connect URL in error message, got: %v", callErr)
+	}
+
+	// 2. Put active token for alice in vault
+	_ = vaultStore.Put(ctx, "alice", "oauth-server", &TokenSet{
+		AccessToken: "alice_live_token",
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
+	})
+
+	// Now token check passes! (We don't have a real upstream client connected, so it will fail after token check at client.CallTool or succeed if mocked)
+	// But the auth error should be gone.
+	_, callErr2 := p.CallTool(ctx, "fetch_data", nil)
+	if callErr2 != nil && contains(callErr2.Error(), "authentication required") {
+		t.Fatalf("expected oauth token check to pass, but got auth error: %v", callErr2)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || (len(s) > 0 && len(substr) > 0 && (stringContains(s, substr))))
 }
@@ -177,3 +238,4 @@ func stringContains(s, substr string) bool {
 	}
 	return false
 }
+

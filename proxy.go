@@ -100,6 +100,9 @@ type Proxy struct {
 
 	secretMgr *SecretManager
 
+	tokenStore TokenStore
+	oauthMgr   *OAuthManager
+
 	totalCalls atomic.Uint64
 	cacheHits  atomic.Uint64
 	errors     atomic.Uint64
@@ -140,6 +143,31 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 			p.logger.Info("semantic vector search enabled via OpenAI embeddings", "model", p.embedder.model)
 		} else if err != nil {
 			p.logger.Error("failed to resolve embeddings api key secret", "err", err)
+		}
+	}
+
+	// Initialize TokenStore and OAuthManager if not already set
+	if p.tokenStore == nil {
+		vaultKey := cfg.Settings.VaultKey
+		if vaultKey != "" {
+			if resolved, err := p.secretMgr.ResolveTemplate(ctx, vaultKey); err == nil {
+				vaultKey = resolved
+			}
+		}
+		store, err := NewEncryptedFileTokenStore(cfg.Settings.VaultPath, vaultKey)
+		if err != nil {
+			p.logger.Error("failed to initialize token vault", "err", err)
+		} else {
+			p.tokenStore = store
+			p.logger.Info("initialized encrypted oauth token vault", "path", store.path)
+		}
+	}
+
+	if p.tokenStore != nil {
+		if p.oauthMgr == nil {
+			p.oauthMgr = NewOAuthManager(p.tokenStore, p.secretMgr, cfg.Settings.PublicURL, cfg.MCPServers, p.logger)
+		} else {
+			p.oauthMgr.UpdateServers(cfg.MCPServers)
 		}
 	}
 
@@ -260,6 +288,15 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 							p.logger.Error("failed to resolve upstream secret header", "server", name, "header", k, "err", err)
 						}
 					}
+				}
+			}
+			if srv.AuthType == "oauth2_pkce_per_user" && p.tokenStore != nil {
+				callerID := "default"
+				if ident := GetCallerIdentity(reqCtx); ident != nil && ident.ID != "" {
+					callerID = ident.ID
+				}
+				if token, err := p.tokenStore.Get(reqCtx, callerID, name); err == nil && token != nil && token.AccessToken != "" {
+					merged["Authorization"] = "Bearer " + token.AccessToken
 				}
 			}
 			return merged
@@ -805,7 +842,39 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 		return nil, err
 	}
 
-	// 4. Cache Lookup
+	// 4. Upstream OAuth2 Per-User Consent & Token Verification
+	if reg.ServerConfig.AuthType == "oauth2_pkce_per_user" {
+		callerID := "default"
+		if ident != nil && ident.ID != "" {
+			callerID = ident.ID
+		}
+		if p.tokenStore != nil {
+			token, err := p.tokenStore.Get(ctx, callerID, reg.ServerName)
+			if err != nil || token == nil || token.AccessToken == "" {
+				p.errors.Add(1)
+				connectURL := ""
+				if p.oauthMgr != nil {
+					connectURL = p.oauthMgr.GetConnectURL(reg.ServerName, callerID)
+				}
+				if connectURL != "" {
+					return nil, fmt.Errorf("authentication required: server %q requires user authorization. Please connect your account by opening: %s", reg.ServerName, connectURL)
+				}
+				return nil, fmt.Errorf("authentication required: server %q requires user authorization, but no oauth tokens were found for user %q", reg.ServerName, callerID)
+			}
+
+			// Proactively refresh if expired or about to expire within 2 minutes
+			if token.IsExpired(2*time.Minute) && p.oauthMgr != nil {
+				if _, refErr := p.oauthMgr.RefreshToken(ctx, callerID, reg.ServerName); refErr != nil {
+					p.logger.Warn("automatic token refresh failed, user re-auth may be required", "server", reg.ServerName, "user", callerID, "err", refErr)
+					if connectURL := p.oauthMgr.GetConnectURL(reg.ServerName, callerID); connectURL != "" {
+						return nil, fmt.Errorf("token expired and refresh failed for %q: please re-authorize by visiting: %s", reg.ServerName, connectURL)
+					}
+				}
+			}
+		}
+	}
+
+	// 5. Cache Lookup
 	cacheKey := ""
 	cacheTTL := reg.ServerConfig.GetCacheTTL()
 	if cacheTTL > 0 {
@@ -831,6 +900,10 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	req.Params.Arguments = args
 
 	p.logger.Info("forwarding call to upstream", "server", reg.ServerName, "tool", reg.Tool.Name, "timeout", timeout)
+	if reg.Client == nil {
+		p.errors.Add(1)
+		return nil, fmt.Errorf("upstream client for server %q is not connected", reg.ServerName)
+	}
 	res, err := reg.Client.CallTool(execCtx, req)
 
 	// 6. Auto-Reconnect Recovery on Broken Pipe
@@ -986,3 +1059,24 @@ func (p *Proxy) Close() {
 		_ = c.Close()
 	}
 }
+
+// TokenStore returns the active TokenStore instance.
+func (p *Proxy) TokenStore() TokenStore {
+	return p.tokenStore
+}
+
+// SetTokenStore allows overriding the TokenStore (useful for testing).
+func (p *Proxy) SetTokenStore(s TokenStore) {
+	p.tokenStore = s
+}
+
+// OAuthManager returns the active OAuthManager instance.
+func (p *Proxy) OAuthManager() *OAuthManager {
+	return p.oauthMgr
+}
+
+// SetOAuthManager allows overriding the OAuthManager (useful for testing).
+func (p *Proxy) SetOAuthManager(m *OAuthManager) {
+	p.oauthMgr = m
+}
+

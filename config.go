@@ -17,10 +17,12 @@ type ServerConfig struct {
 	Headers      map[string]string `json:"headers,omitempty"`
 	Description  string            `json:"description,omitempty"`
 	Timeout      string            `json:"timeout,omitempty"`      // e.g. "30s", "1m"
-	CacheTTL     string            `json:"cache_ttl,omitempty"`    // e.g. "5m", "1h"
-	ReadOnly     bool              `json:"read_only,omitempty"`    // Blocks write/destructive mutations
-	AllowedTools []string          `json:"allowed_tools,omitempty"`// Whitelist glob patterns
-	BlockedTools []string          `json:"blocked_tools,omitempty"`// Blacklist glob patterns
+	CacheTTL     string             `json:"cache_ttl,omitempty"`    // e.g. "5m", "1h"
+	ReadOnly     bool               `json:"read_only,omitempty"`    // Blocks write/destructive mutations
+	AllowedTools []string           `json:"allowed_tools,omitempty"`// Whitelist glob patterns
+	BlockedTools []string           `json:"blocked_tools,omitempty"`// Blacklist glob patterns
+	AuthType     string             `json:"auth_type,omitempty"`    // "bearer_token" (default) or "oauth2_pkce_per_user"
+	OAuth2       *OAuthServerConfig `json:"oauth2,omitempty"`       // Upstream OAuth 2.0 configuration
 }
 
 // GetURL returns either URL or ServerURL.
@@ -66,6 +68,15 @@ type IdentityConfig struct {
 	UpstreamHeaders map[string]map[string]string `json:"upstream_headers,omitempty"`  // Map upstream server -> headers with secret URIs (e.g. op://, env://)
 }
 
+// OAuthServerConfig defines upstream OAuth 2.0 configuration for user delegation.
+type OAuthServerConfig struct {
+	ClientID     string   `json:"client_id,omitempty"`
+	ClientSecret string   `json:"client_secret,omitempty"`
+	AuthURL      string   `json:"auth_url,omitempty"`
+	TokenURL     string   `json:"token_url,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+}
+
 // EmbeddingsConfig defines optional OpenAI-compatible vector embeddings for semantic search.
 type EmbeddingsConfig struct {
 	APIKey string `json:"apiKey,omitempty"` // OpenAI API Key (or env var OPENAI_API_KEY)
@@ -78,6 +89,9 @@ type SettingsConfig struct {
 	DefaultTimeout string `json:"defaultTimeout,omitempty"` // Default "60s"
 	AuthKey        string `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
 	OpenAIKey      string `json:"openAIKey,omitempty"`      // Alternative shorthand for embeddings API key
+	VaultPath      string `json:"vaultPath,omitempty"`      // Path to encrypted vault file (default: ~/.config/mcp-search-proxy/vault.enc)
+	VaultKey       string `json:"vaultKey,omitempty"`       // Master key or secret URI (e.g. op://..., env://...) for vault
+	PublicURL      string `json:"publicUrl,omitempty"`      // Base public URL for OAuth callbacks (e.g. "http://localhost:8080")
 }
 
 // Config wraps the top-level MCP servers configuration.

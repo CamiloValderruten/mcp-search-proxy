@@ -318,6 +318,14 @@ func main() {
 		mux.HandleFunc("/mcp", handleMCP)
 		mux.HandleFunc("/mcp/", handleMCP)
 
+		// 4. OAuth2 Endpoints for Upstream Per-User Delegation
+		if proxy.OAuthManager() != nil {
+			mux.HandleFunc("/oauth/connect/", proxy.OAuthManager().HandleConnect)
+			mux.HandleFunc("/oauth/callback/", proxy.OAuthManager().HandleCallback)
+			mux.HandleFunc("/oauth/status", proxy.OAuthManager().HandleStatus)
+			mux.HandleFunc("/oauth/disconnect/", proxy.OAuthManager().HandleDisconnect)
+		}
+
 		httpServer := &http.Server{
 			Addr:         *listenAddr,
 			Handler:      mux,

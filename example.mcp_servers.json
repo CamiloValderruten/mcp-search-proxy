@@ -1,7 +1,9 @@
 {
   "settings": {
     "defaultTimeout": "30s",
-    "authKey": "${GLOBAL_MCP_KEY}"
+    "authKey": "${GLOBAL_MCP_KEY}",
+    "publicUrl": "http://localhost:8080",
+    "vaultPath": "~/.config/mcp-search-proxy/vault.enc"
   },
   "embeddings": {
     "apiKey": "${OPENAI_API_KEY}",
@@ -86,6 +88,18 @@
         "Authorization": "Bearer ${GATEWAY_TOKEN}"
       },
       "description": "Internal enterprise APIs, customer data lookups, and billing services."
+    },
+    "github-oauth": {
+      "url": "https://mcp.github.com/mcp",
+      "description": "GitHub user repository management via personal OAuth delegation.",
+      "auth_type": "oauth2_pkce_per_user",
+      "oauth2": {
+        "client_id": "op://Production/GitHubOAuth/client_id",
+        "client_secret": "op://Production/GitHubOAuth/client_secret",
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "scopes": ["repo", "read:user"]
+      }
     }
   }
 }
