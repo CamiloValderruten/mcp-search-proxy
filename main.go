@@ -121,6 +121,16 @@ func main() {
 		}
 	}()
 
+	var googleAuthHandler *GoogleAuthHandler
+	if cfg.Settings.GoogleAuth != nil {
+		gh, err := NewGoogleAuthHandler(cfg.Settings.GoogleAuth, proxy.secretMgr, cfg.Settings.PublicURL, proxy, logger)
+		if err != nil {
+			logger.Error("failed to initialize google authentication", "err", err)
+		} else {
+			googleAuthHandler = gh
+		}
+	}
+
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
@@ -133,8 +143,22 @@ func main() {
 		mcp.WithDescription("List all connected upstream MCP servers, descriptions, tool counts, and security policies accessible to your identity."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
 		}
 
 		servers := proxy.ListServers(ctx)
@@ -165,8 +189,22 @@ func main() {
 		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login", cfg.Settings.PublicURL)), nil
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
 		}
 
 		query, err := request.RequireString("query")
@@ -184,8 +222,22 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
 		}
 
 		toolName, err := request.RequireString("tool_name")
@@ -214,8 +266,22 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
 	)
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		if cfg.Settings.GoogleAuth != nil && GetCallerIdentity(ctx) == nil {
-			return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login", cfg.Settings.PublicURL)), nil
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
 		}
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
@@ -299,18 +365,11 @@ func main() {
 		})
 
 		// 3. Optional Inbound Google OAuth Handler
-		var googleAuthHandler *GoogleAuthHandler
-		if cfg.Settings.GoogleAuth != nil {
-			gh, err := NewGoogleAuthHandler(cfg.Settings.GoogleAuth, proxy.secretMgr, cfg.Settings.PublicURL, proxy, logger)
-			if err != nil {
-				logger.Error("failed to initialize google authentication", "err", err)
-			} else {
-				googleAuthHandler = gh
-				mux.HandleFunc("/auth/login", googleAuthHandler.HandleLogin)
-				mux.HandleFunc("/auth/callback", googleAuthHandler.HandleCallback)
-				mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
-				mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
-			}
+		if googleAuthHandler != nil {
+			mux.HandleFunc("/auth/login", googleAuthHandler.HandleLogin)
+			mux.HandleFunc("/auth/callback", googleAuthHandler.HandleCallback)
+			mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
 		}
 
 		// 4. MCP Streamable HTTP / SSE Endpoint with Identity Authentication

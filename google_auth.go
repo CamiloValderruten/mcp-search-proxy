@@ -36,6 +36,11 @@ type googleUserInfo struct {
 	Picture       string `json:"picture"`
 }
 
+type googleAuthState struct {
+	CreatedAt time.Time
+	Caller    string
+}
+
 // GoogleAuthHandler handles Inbound "Sign in with Google" to authenticate AI clients and users to the proxy.
 type GoogleAuthHandler struct {
 	cfg          *GoogleAuthConfig
@@ -52,7 +57,7 @@ type GoogleAuthHandler struct {
 	sessions   map[string]string // sessionToken -> email
 
 	statesMu sync.Mutex
-	states   map[string]time.Time
+	states   map[string]googleAuthState
 }
 
 // NewGoogleAuthHandler creates a new GoogleAuthHandler.
@@ -69,7 +74,7 @@ func NewGoogleAuthHandler(cfg *GoogleAuthConfig, secretMgr *SecretManager, publi
 		logger:    logger,
 		client:    &http.Client{Timeout: 15 * time.Second},
 		sessions:  make(map[string]string),
-		states:    make(map[string]time.Time),
+		states:    make(map[string]googleAuthState),
 	}
 
 	// 1. Resolve credentials from KeyFile if specified
@@ -136,16 +141,17 @@ func min(a, b int) int {
 // HandleLogin initiates the browser redirect to Google OAuth.
 func (h *GoogleAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	state := generateRandomString(32)
+	caller := r.URL.Query().Get("caller")
 
 	h.statesMu.Lock()
 	// Prune old states
 	cutoff := time.Now().Add(-15 * time.Minute)
 	for k, t := range h.states {
-		if t.Before(cutoff) {
+		if t.CreatedAt.Before(cutoff) {
 			delete(h.states, k)
 		}
 	}
-	h.states[state] = time.Now()
+	h.states[state] = googleAuthState{CreatedAt: time.Now(), Caller: caller}
 	h.statesMu.Unlock()
 
 	authURL, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
@@ -155,8 +161,8 @@ func (h *GoogleAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) 
 	q.Set("response_type", "code")
 	q.Set("scope", "openid email profile")
 	q.Set("state", state)
-	q.Set("access_type", "online")
-	q.Set("prompt", "select_account")
+	q.Set("access_type", "offline")
+	q.Set("prompt", "consent select_account")
 	authURL.RawQuery = q.Encode()
 
 	http.Redirect(w, r, authURL.String(), http.StatusFound)
@@ -172,7 +178,7 @@ func (h *GoogleAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Reques
 	}
 
 	h.statesMu.Lock()
-	_, exists := h.states[state]
+	st, exists := h.states[state]
 	if exists {
 		delete(h.states, state)
 	}
@@ -241,7 +247,56 @@ func (h *GoogleAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Create session token
+	// Determine caller identity
+	callerID := st.Caller
+	if callerID == "" {
+		if h.proxy != nil {
+			h.proxy.mu.RLock()
+			for id, c := range h.proxy.identities {
+				if c.MatchesEmail(id, uInfo.Email) {
+					callerID = id
+					break
+				}
+			}
+			h.proxy.mu.RUnlock()
+		}
+	}
+	if callerID == "" {
+		callerID = uInfo.Email
+	}
+
+	// Persist tokens to vault
+	if h.proxy != nil && h.proxy.TokenStore() != nil {
+		var exp time.Time
+		if tokenResp.ExpiresIn > 0 {
+			exp = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+		}
+		tSet := &TokenSet{
+			AccessToken:  tokenResp.AccessToken,
+			RefreshToken: tokenResp.RefreshToken,
+			TokenType:    tokenResp.TokenType,
+			ExpiresAt:    exp,
+			Scopes:       strings.Split(tokenResp.Scope, " "),
+			UpdatedAt:    time.Now(),
+		}
+		if tSet.TokenType == "" {
+			tSet.TokenType = "Bearer"
+		}
+		// Preserve existing refresh token if Google omitted it in this exchange
+		if tSet.RefreshToken == "" {
+			if existing, err := h.proxy.TokenStore().Get(r.Context(), callerID, "__google_gateway__"); err == nil && existing != nil {
+				tSet.RefreshToken = existing.RefreshToken
+			}
+		}
+
+		if err := h.proxy.TokenStore().Put(r.Context(), callerID, "__google_gateway__", tSet); err != nil {
+			h.logger.Error("failed to persist google gateway tokens to vault", "caller", callerID, "err", err)
+		} else {
+			h.logger.Info("successfully persisted google gateway tokens in vault", "caller", callerID, "email", uInfo.Email, "has_refresh", tSet.RefreshToken != "")
+		}
+	}
+
+	// Create session token for browser cookie
 	sessionToken := generateRandomString(32)
 	h.sessionsMu.Lock()
 	h.sessions[sessionToken] = uInfo.Email
@@ -340,4 +395,92 @@ func (h *GoogleAuthHandler) HandleProtectedResourceMetadata(w http.ResponseWrite
 		"authorization_servers": []string{"https://accounts.google.com"},
 		"scopes_supported":      []string{"openid", "email", "profile", "tools:read", "tools:call"},
 	})
+}
+
+// IsCallerAuthenticated checks whether the given callerID has a valid (or refreshable) Google gateway token in the vault.
+func (h *GoogleAuthHandler) IsCallerAuthenticated(ctx context.Context, callerID string) (bool, error) {
+	if h == nil || h.proxy == nil || h.proxy.TokenStore() == nil {
+		return true, nil
+	}
+	if callerID == "" {
+		return false, nil
+	}
+
+	token, err := h.proxy.TokenStore().Get(ctx, callerID, "__google_gateway__")
+	if err != nil || token == nil || token.AccessToken == "" {
+		return false, nil
+	}
+
+	// If token has not expired (with 1-minute buffer), it's valid
+	if !token.IsExpired(1 * time.Minute) {
+		return true, nil
+	}
+
+	// If token has expired, attempt silent refresh if refresh token is available
+	if token.RefreshToken != "" {
+		refreshed, err := h.RefreshToken(ctx, callerID)
+		if err == nil && refreshed != nil {
+			return true, nil
+		}
+		h.logger.Warn("failed to refresh expired google gateway token", "caller", callerID, "err", err)
+	}
+
+	return false, nil
+}
+
+// RefreshToken silently refreshes an expired Google Gateway access token.
+func (h *GoogleAuthHandler) RefreshToken(ctx context.Context, callerID string) (*TokenSet, error) {
+	token, err := h.proxy.TokenStore().Get(ctx, callerID, "__google_gateway__")
+	if err != nil {
+		return nil, fmt.Errorf("getting token from vault: %w", err)
+	}
+	if token.RefreshToken == "" {
+		return nil, fmt.Errorf("no refresh token available for caller %q", callerID)
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", token.RefreshToken)
+	form.Set("client_id", h.clientID)
+	form.Set("client_secret", h.clientSecret)
+
+	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("creating token refresh request: %w", err)
+	}
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := h.client.Do(tokenReq)
+	if err != nil {
+		return nil, fmt.Errorf("refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("google returned HTTP %d on token refresh: %s", resp.StatusCode, string(respBody))
+	}
+
+	var tokenResp oauthTokenResponse
+	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+		return nil, fmt.Errorf("parsing token response: %w", err)
+	}
+
+	var exp time.Time
+	if tokenResp.ExpiresIn > 0 {
+		exp = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	}
+
+	token.AccessToken = tokenResp.AccessToken
+	if tokenResp.RefreshToken != "" {
+		token.RefreshToken = tokenResp.RefreshToken
+	}
+	token.ExpiresAt = exp
+	token.UpdatedAt = time.Now()
+
+	if err := h.proxy.TokenStore().Put(ctx, callerID, "__google_gateway__", token); err != nil {
+		return nil, fmt.Errorf("saving refreshed token: %w", err)
+	}
+	h.logger.Info("successfully refreshed google gateway token", "caller", callerID)
+	return token, nil
 }

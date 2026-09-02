@@ -103,3 +103,54 @@ func TestGoogleAuthLifecycle(t *testing.T) {
 		t.Fatalf("expected bearer session auth to succeed, got email=%s, ok=%v", emailBearer, okBearer)
 	}
 }
+
+func TestGoogleGatewayVaultAuth(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	secretMgr := NewSecretManager(1 * time.Minute)
+	proxy := NewProxy(logger, 5*time.Second)
+
+	tempDir := t.TempDir()
+	vaultPath := tempDir + "/vault.enc"
+	store, err := NewEncryptedFileTokenStore(vaultPath, "test-master-key-1234567890123456")
+	if err != nil {
+		t.Fatalf("creating token store: %v", err)
+	}
+	proxy.SetTokenStore(store)
+
+	cfg := &GoogleAuthConfig{
+		ClientID:     "mock-client-id",
+		ClientSecret: "mock-client-secret",
+		RedirectURL:  "http://localhost:8080/auth/callback",
+		AllowedUsers: []string{"cvalderruten@gmail.com"},
+	}
+
+	handler, err := NewGoogleAuthHandler(cfg, secretMgr, "http://localhost:8080", proxy, logger)
+	if err != nil {
+		t.Fatalf("creating handler: %v", err)
+	}
+
+	ctx := t.Context()
+
+	// 1. Initial state: caller is not authenticated
+	isAuth, err := handler.IsCallerAuthenticated(ctx, "camilo")
+	if err != nil || isAuth {
+		t.Fatalf("expected isAuth=false for unauthenticated caller, got %v, err=%v", isAuth, err)
+	}
+
+	// 2. Put Google gateway tokens into vault
+	err = store.Put(ctx, "camilo", "__google_gateway__", &TokenSet{
+		AccessToken:  "mock-google-access-token",
+		RefreshToken: "mock-google-refresh-token",
+		ExpiresAt:    time.Now().Add(1 * time.Hour),
+		UpdatedAt:    time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("storing tokens: %v", err)
+	}
+
+	// 3. Verify caller is now authenticated
+	isAuth, err = handler.IsCallerAuthenticated(ctx, "camilo")
+	if err != nil || !isAuth {
+		t.Fatalf("expected isAuth=true for authenticated caller, got %v, err=%v", isAuth, err)
+	}
+}
