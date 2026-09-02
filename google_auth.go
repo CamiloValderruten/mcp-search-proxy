@@ -93,15 +93,9 @@ func NewGoogleAuthHandler(cfg *GoogleAuthConfig, secretMgr *SecretManager, publi
 		if kf.Web != nil {
 			h.clientID = kf.Web.ClientID
 			h.clientSecret = kf.Web.ClientSecret
-			if len(kf.Web.RedirectURIs) > 0 && cfg.RedirectURL == "" {
-				h.redirectURL = kf.Web.RedirectURIs[0]
-			}
 		} else if kf.Installed != nil {
 			h.clientID = kf.Installed.ClientID
 			h.clientSecret = kf.Installed.ClientSecret
-			if len(kf.Installed.RedirectURIs) > 0 && cfg.RedirectURL == "" {
-				h.redirectURL = kf.Installed.RedirectURIs[0]
-			}
 		}
 	}
 
