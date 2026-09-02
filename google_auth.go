@@ -297,7 +297,7 @@ func (h *GoogleAuthHandler) isEmailAllowed(email string) bool {
 		h.proxy.mu.RLock()
 		defer h.proxy.mu.RUnlock()
 		for id, ident := range h.proxy.identities {
-			if (ident.Email != "" && strings.EqualFold(ident.Email, email)) || strings.EqualFold(id, email) || strings.HasPrefix(strings.ToLower(email), strings.ToLower(id)) {
+			if ident.MatchesEmail(id, email) {
 				return true
 			}
 		}

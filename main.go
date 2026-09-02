@@ -319,7 +319,7 @@ func main() {
 					callerID := userEmail
 					var identCfg IdentityConfig
 					for id, c := range cfg.Identities {
-						if (c.Email != "" && strings.EqualFold(c.Email, userEmail)) || strings.EqualFold(id, userEmail) || strings.HasPrefix(strings.ToLower(userEmail), strings.ToLower(id)) {
+						if c.MatchesEmail(id, userEmail) {
 							callerID = id
 							identCfg = c
 							break

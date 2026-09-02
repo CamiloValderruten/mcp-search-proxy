@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -59,7 +60,8 @@ func (s *ServerConfig) GetCacheTTL() time.Duration {
 
 // IdentityConfig defines RBAC, upstream identity mappings, and dynamic credentials for a caller client.
 type IdentityConfig struct {
-	Email           string                       `json:"email,omitempty"`             // Google OAuth user email
+	Email           string                       `json:"email,omitempty"`             // Primary Google OAuth user email
+	Emails          []string                     `json:"emails,omitempty"`            // Multiple allowed emails/aliases
 	Token           string                       `json:"token,omitempty"`             // Bearer token for HTTP auth
 	AllowedServers  []string                     `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
 	AllowedTools    []string                     `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")
@@ -67,6 +69,25 @@ type IdentityConfig struct {
 	ReadOnly        bool                         `json:"read_only,omitempty"`         // If true, enforces read-only tool execution
 	UpstreamUserMap map[string]string            `json:"upstream_user_map,omitempty"` // Map upstream server -> backend user/account id
 	UpstreamHeaders map[string]map[string]string `json:"upstream_headers,omitempty"`  // Map upstream server -> headers with secret URIs (e.g. op://, env://)
+}
+
+// MatchesEmail checks if a given email matches the identity's configured email or aliases.
+func (c IdentityConfig) MatchesEmail(id, email string) bool {
+	if email == "" {
+		return false
+	}
+	if c.Email != "" && strings.EqualFold(c.Email, email) {
+		return true
+	}
+	for _, e := range c.Emails {
+		if strings.EqualFold(e, email) {
+			return true
+		}
+	}
+	if strings.EqualFold(id, email) || strings.HasPrefix(strings.ToLower(email), strings.ToLower(id)) {
+		return true
+	}
+	return false
 }
 
 // OAuthServerConfig defines upstream OAuth 2.0 configuration for user delegation.
