@@ -132,6 +132,17 @@ func (m *OAuthManager) DiscoverUpstreamOAuth(ctx context.Context, serverName, se
 
 	// 1. Determine PRM URL
 	prmURL := ""
+	if wwwAuthHeader == "" {
+		probeReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, serverURL, nil)
+		if probeResp, probeErr := m.client.Do(probeReq); probeErr == nil {
+			wwwAuthHeader = probeResp.Header.Get("WWW-Authenticate")
+			if wwwAuthHeader == "" {
+				wwwAuthHeader = probeResp.Header.Get("X-Amzn-Remapped-Www-Authenticate")
+			}
+			probeResp.Body.Close()
+		}
+	}
+
 	if wwwAuthHeader != "" {
 		if idx := strings.Index(wwwAuthHeader, "resource_metadata=\""); idx != -1 {
 			sub := wwwAuthHeader[idx+len("resource_metadata=\""):]
@@ -160,6 +171,21 @@ func (m *OAuthManager) DiscoverUpstreamOAuth(ctx context.Context, serverName, se
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching protected resource metadata: %w", err)
+	}
+
+	// Fallback to path-suffixed PRM if base returned 404
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		parsed, _ := url.Parse(serverURL)
+		if parsed != nil && parsed.Path != "" && parsed.Path != "/" {
+			altURL := fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource%s", parsed.Scheme, parsed.Host, parsed.Path)
+			m.logger.Info("retrying protected resource metadata with path", "server", serverName, "url", altURL)
+			altReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, altURL, nil)
+			altReq.Header.Set("Accept", "application/json")
+			if altResp, altErr := m.client.Do(altReq); altErr == nil {
+				resp = altResp
+			}
+		}
 	}
 	defer resp.Body.Close()
 
