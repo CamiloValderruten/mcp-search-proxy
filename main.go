@@ -174,7 +174,13 @@ func main() {
 				roFlag = " `[read-only]`"
 			}
 			if srv.Status == "error" {
-				sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+				errLower := strings.ToLower(srv.Error)
+				if strings.Contains(errLower, "authorization") || strings.Contains(errLower, "unauthorized") {
+					connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, srv.Name, callerID)
+					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[requires authorization]`): %s\n  ⚠️ Action Required: Do NOT attempt alternative shell commands or look for credentials on disk.\n  Immediately tell the user to connect their account:\n  👉 %s\n", srv.Name, desc, connectURL))
+				} else {
+					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+				}
 			} else {
 				sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
 			}
@@ -212,6 +218,28 @@ func main() {
 			return mcp.NewToolResultError("missing required parameter 'query'"), nil
 		}
 		summary := proxy.SearchToolsFormatConcise(ctx, query, 8)
+
+		proxy.mu.RLock()
+		var unauthServers []string
+		for sName, sErr := range proxy.serverErrors {
+			sErrLower := strings.ToLower(sErr)
+			if strings.Contains(sErrLower, "authorization") || strings.Contains(sErrLower, "unauthorized") {
+				unauthServers = append(unauthServers, sName)
+			}
+		}
+		proxy.mu.RUnlock()
+
+		if len(unauthServers) > 0 {
+			var authExtra strings.Builder
+			authExtra.WriteString(summary)
+			authExtra.WriteString("\n\n⚠️ Note: Some upstream servers require authorization and their tools are not yet indexed:\n")
+			for _, sName := range unauthServers {
+				connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, sName, callerID)
+				authExtra.WriteString(fmt.Sprintf("- **`%s`**: Do NOT attempt alternative shell commands or look for credentials on disk. Tell the user to connect:\n  👉 %s\n", sName, connectURL))
+			}
+			summary = authExtra.String()
+		}
+
 		return mcp.NewToolResultText(summary), nil
 	})
 
@@ -254,6 +282,28 @@ func main() {
 
 		res, err := proxy.CallTool(ctx, toolName, args)
 		if err != nil {
+			errLower := strings.ToLower(err.Error())
+			if strings.Contains(errLower, "not found") {
+				proxy.mu.RLock()
+				var unauthServers []string
+				for sName, sErr := range proxy.serverErrors {
+					sErrLower := strings.ToLower(sErr)
+					if strings.Contains(sErrLower, "authorization") || strings.Contains(sErrLower, "unauthorized") {
+						unauthServers = append(unauthServers, sName)
+					}
+				}
+				proxy.mu.RUnlock()
+
+				if len(unauthServers) > 0 {
+					var authMsg strings.Builder
+					authMsg.WriteString(fmt.Sprintf("%s\n\n⚠️ Note: The requested tool might belong to an upstream server that requires authorization and is not yet indexed:\n", err.Error()))
+					for _, sName := range unauthServers {
+						connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, sName, callerID)
+						authMsg.WriteString(fmt.Sprintf("- **`%s`**: Do NOT attempt alternative shell commands or look for credentials on disk. Tell the user to connect:\n  👉 %s\n", sName, connectURL))
+					}
+					return mcp.NewToolResultError(authMsg.String()), nil
+				}
+			}
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return res, nil

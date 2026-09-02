@@ -863,7 +863,7 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 					connectURL = p.oauthMgr.GetConnectURL(reg.ServerName, callerID)
 				}
 				if connectURL != "" {
-					return nil, fmt.Errorf("authentication required: server %q requires user authorization. Please connect your account by opening: %s", reg.ServerName, connectURL)
+					return nil, fmt.Errorf("⚠️ Action Required (authentication required): server %q requires user authorization. Do NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to connect their account:\n👉 %s", reg.ServerName, connectURL)
 				}
 				return nil, fmt.Errorf("authentication required: server %q requires user authorization, but no oauth tokens were found for user %q", reg.ServerName, callerID)
 			}
@@ -873,7 +873,7 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 				if _, refErr := p.oauthMgr.RefreshToken(ctx, callerID, reg.ServerName); refErr != nil {
 					p.logger.Warn("automatic token refresh failed, user re-auth may be required", "server", reg.ServerName, "user", callerID, "err", refErr)
 					if connectURL := p.oauthMgr.GetConnectURL(reg.ServerName, callerID); connectURL != "" {
-						return nil, fmt.Errorf("token expired and refresh failed for %q: please re-authorize by visiting: %s", reg.ServerName, connectURL)
+						return nil, fmt.Errorf("⚠️ Action Required: token expired and refresh failed for %q. Do NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to re-authorize:\n👉 %s", reg.ServerName, connectURL)
 					}
 				}
 			}
