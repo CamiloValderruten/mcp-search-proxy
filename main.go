@@ -329,21 +329,17 @@ func main() {
 					mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
 					return
 				}
-			}
 
-			// Check global authKey if configured
-			if cfg.Settings.AuthKey != "" && token != cfg.Settings.AuthKey {
-				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
-					reqCtx = WithIdentity(reqCtx, id, identCfg)
-				} else {
-					http.Error(w, "Unauthorized: invalid bearer token or client identity", http.StatusUnauthorized)
-					return
+				// If not authenticated via Google, check if request has a valid non-empty identity token
+				if token != "" {
+					if id, identCfg, ok := proxy.ResolveIdentity(token); ok && identCfg.Token != "" {
+						reqCtx = WithIdentity(reqCtx, id, identCfg)
+						mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
+						return
+					}
 				}
-			} else if token != "" {
-				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
-					reqCtx = WithIdentity(reqCtx, id, identCfg)
-				}
-			} else if googleAuthHandler != nil {
+
+				// Strictly reject unauthenticated requests
 				w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=\"%s/.well-known/oauth-protected-resource\"", cfg.Settings.PublicURL))
 				http.Error(w, fmt.Sprintf("Unauthorized: Please sign in with Google at %s/auth/login", cfg.Settings.PublicURL), http.StatusUnauthorized)
 				return

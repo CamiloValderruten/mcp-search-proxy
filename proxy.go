@@ -413,10 +413,6 @@ func (p *Proxy) ResolveIdentity(tokenOrID string) (string, IdentityConfig, bool)
 		return "", IdentityConfig{}, false
 	}
 
-	if cfg, ok := p.identities[tokenOrID]; ok {
-		return tokenOrID, cfg, true
-	}
-
 	for id, cfg := range p.identities {
 		if cfg.Token != "" && cfg.Token == tokenOrID {
 			return id, cfg, true
