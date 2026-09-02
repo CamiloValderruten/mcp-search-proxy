@@ -84,14 +84,24 @@ type EmbeddingsConfig struct {
 	URL    string `json:"url,omitempty"`    // Default: https://api.openai.com/v1/embeddings
 }
 
+// GoogleAuthConfig defines inbound "Sign in with Google" settings for the proxy gateway.
+type GoogleAuthConfig struct {
+	ClientID     string   `json:"clientId,omitempty"`
+	ClientSecret string   `json:"clientSecret,omitempty"`
+	KeyFile      string   `json:"keyFile,omitempty"`      // Path to GCP OAuth client json file (e.g. gcp-oauth.keys.json)
+	RedirectURL  string   `json:"redirectUrl,omitempty"`  // e.g. "http://localhost:8080/auth/callback"
+	AllowedUsers []string `json:"allowedUsers,omitempty"` // Whitelist of allowed emails, or "*"
+}
+
 // SettingsConfig defines global proxy options.
 type SettingsConfig struct {
-	DefaultTimeout string `json:"defaultTimeout,omitempty"` // Default "60s"
-	AuthKey        string `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
-	OpenAIKey      string `json:"openAIKey,omitempty"`      // Alternative shorthand for embeddings API key
-	VaultPath      string `json:"vaultPath,omitempty"`      // Path to encrypted vault file (default: ~/.config/mcp-search-proxy/vault.enc)
-	VaultKey       string `json:"vaultKey,omitempty"`       // Master key or secret URI (e.g. op://..., env://...) for vault
-	PublicURL      string `json:"publicUrl,omitempty"`      // Base public URL for OAuth callbacks (e.g. "http://localhost:8080")
+	DefaultTimeout string            `json:"defaultTimeout,omitempty"` // Default "60s"
+	AuthKey        string            `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
+	OpenAIKey      string            `json:"openAIKey,omitempty"`      // Alternative shorthand for embeddings API key
+	VaultPath      string            `json:"vaultPath,omitempty"`      // Path to encrypted vault file (default: ~/.config/mcp-search-proxy/vault.enc)
+	VaultKey       string            `json:"vaultKey,omitempty"`       // Master key or secret URI (e.g. op://..., env://...) for vault
+	PublicURL      string            `json:"publicUrl,omitempty"`      // Base public URL for OAuth callbacks (e.g. "http://localhost:8080")
+	GoogleAuth     *GoogleAuthConfig `json:"googleAuth,omitempty"`     // Inbound Google OAuth configuration
 }
 
 // Config wraps the top-level MCP servers configuration.

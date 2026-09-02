@@ -290,7 +290,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 					}
 				}
 			}
-			if srv.AuthType == "oauth2_pkce_per_user" && p.tokenStore != nil {
+			if (srv.AuthType == "oauth2_pkce_per_user" || (p.oauthMgr != nil && p.oauthMgr.IsOAuthRequired(name))) && p.tokenStore != nil {
 				callerID := "default"
 				if ident := GetCallerIdentity(reqCtx); ident != nil && ident.ID != "" {
 					callerID = ident.ID
@@ -843,7 +843,8 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	}
 
 	// 4. Upstream OAuth2 Per-User Consent & Token Verification
-	if reg.ServerConfig.AuthType == "oauth2_pkce_per_user" {
+	isOAuth := reg.ServerConfig.AuthType == "oauth2_pkce_per_user" || (p.oauthMgr != nil && p.oauthMgr.IsOAuthRequired(reg.ServerName))
+	if isOAuth {
 		callerID := "default"
 		if ident != nil && ident.ID != "" {
 			callerID = ident.ID
@@ -918,6 +919,19 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 
 	if err != nil {
 		p.errors.Add(1)
+		// Check for 401 / Unauthorized on remote servers and trigger dynamic discovery
+		if p.oauthMgr != nil && reg.ServerConfig.GetURL() != "" && (strings.Contains(err.Error(), "401") || strings.Contains(strings.ToLower(err.Error()), "unauthorized")) {
+			p.logger.Info("upstream returned 401 unauthorized, triggering dynamic oauth discovery", "server", reg.ServerName)
+			if disc, discErr := p.oauthMgr.DiscoverUpstreamOAuth(ctx, reg.ServerName, reg.ServerConfig.GetURL(), ""); discErr == nil && disc != nil {
+				callerID := "default"
+				if ident != nil && ident.ID != "" {
+					callerID = ident.ID
+				}
+				connectURL := p.oauthMgr.GetConnectURL(reg.ServerName, callerID)
+				return nil, fmt.Errorf("authentication required: server %q requires authorization. Please sign in by visiting: %s", reg.ServerName, connectURL)
+			}
+		}
+
 		if execCtx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("tool %q timed out after %s on upstream server %q", reg.Tool.Name, timeout, reg.ServerName)
 		}

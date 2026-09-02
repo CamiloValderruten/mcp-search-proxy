@@ -283,7 +283,22 @@ func main() {
 			_ = json.NewEncoder(w).Encode(m)
 		})
 
-		// 3. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
+		// 3. Optional Inbound Google OAuth Handler
+		var googleAuthHandler *GoogleAuthHandler
+		if cfg.Settings.GoogleAuth != nil {
+			gh, err := NewGoogleAuthHandler(cfg.Settings.GoogleAuth, proxy.secretMgr, cfg.Settings.PublicURL, proxy, logger)
+			if err != nil {
+				logger.Error("failed to initialize google authentication", "err", err)
+			} else {
+				googleAuthHandler = gh
+				mux.HandleFunc("/auth/login", googleAuthHandler.HandleLogin)
+				mux.HandleFunc("/auth/callback", googleAuthHandler.HandleCallback)
+				mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
+				mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
+			}
+		}
+
+		// 4. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
 		handleMCP := func(w http.ResponseWriter, r *http.Request) {
 			reqCtx := r.Context()
 
@@ -298,6 +313,24 @@ func main() {
 				token = id
 			}
 
+			// Check Google authentication first if active
+			if googleAuthHandler != nil {
+				if userEmail, ok := googleAuthHandler.AuthenticateRequest(r); ok {
+					callerID := userEmail
+					var identCfg IdentityConfig
+					for id, c := range cfg.Identities {
+						if strings.EqualFold(id, userEmail) || strings.HasPrefix(strings.ToLower(userEmail), strings.ToLower(id)) {
+							callerID = id
+							identCfg = c
+							break
+						}
+					}
+					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
+					mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
+					return
+				}
+			}
+
 			// Check global authKey if configured
 			if cfg.Settings.AuthKey != "" && token != cfg.Settings.AuthKey {
 				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
@@ -310,6 +343,9 @@ func main() {
 				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
 					reqCtx = WithIdentity(reqCtx, id, identCfg)
 				}
+			} else if googleAuthHandler != nil && cfg.Settings.AuthKey == "" && len(cfg.Identities) > 0 {
+				http.Error(w, "Unauthorized: Please authenticate via Google at /auth/login", http.StatusUnauthorized)
+				return
 			}
 
 			mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
@@ -318,7 +354,7 @@ func main() {
 		mux.HandleFunc("/mcp", handleMCP)
 		mux.HandleFunc("/mcp/", handleMCP)
 
-		// 4. OAuth2 Endpoints for Upstream Per-User Delegation
+		// 5. OAuth2 Endpoints for Upstream Per-User Delegation
 		if proxy.OAuthManager() != nil {
 			mux.HandleFunc("/oauth/connect/", proxy.OAuthManager().HandleConnect)
 			mux.HandleFunc("/oauth/callback/", proxy.OAuthManager().HandleCallback)

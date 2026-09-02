@@ -45,6 +45,41 @@ type OAuthManager struct {
 
 	statesMu sync.Mutex
 	states   map[string]oauthState
+
+	discoveredMu sync.RWMutex
+	discovered   map[string]*DiscoveredOAuth
+}
+
+// DiscoveredOAuth holds dynamically discovered OAuth2 endpoints from an upstream MCP server.
+type DiscoveredOAuth struct {
+	ServerName          string   `json:"server_name"`
+	ResourceMetadataURL string   `json:"resource_metadata_url,omitempty"`
+	AuthServerURL       string   `json:"auth_server_url,omitempty"`
+	AuthURL             string   `json:"auth_url"`
+	TokenURL            string   `json:"token_url"`
+	RegistrationURL     string   `json:"registration_url,omitempty"`
+	ClientID            string   `json:"client_id,omitempty"`
+	ClientSecret        string   `json:"client_secret,omitempty"`
+	Scopes              []string `json:"scopes,omitempty"`
+}
+
+type protectedResourceMetadata struct {
+	Resource             string   `json:"resource"`
+	AuthorizationServers []string `json:"authorization_servers"`
+	ScopesSupported      []string `json:"scopes_supported"`
+}
+
+type authServerMetadata struct {
+	Issuer                string   `json:"issuer"`
+	AuthorizationEndpoint string   `json:"authorization_endpoint"`
+	TokenEndpoint         string   `json:"token_endpoint"`
+	RegistrationEndpoint  string   `json:"registration_endpoint"`
+	ScopesSupported       []string `json:"scopes_supported"`
+}
+
+type dynamicClientRegistrationResponse struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret,omitempty"`
 }
 
 // NewOAuthManager creates a new OAuthManager instance.
@@ -55,13 +90,14 @@ func NewOAuthManager(store TokenStore, secretMgr *SecretManager, publicURL strin
 	publicURL = strings.TrimSuffix(publicURL, "/")
 
 	return &OAuthManager{
-		store:     store,
-		secretMgr: secretMgr,
-		publicURL: publicURL,
-		servers:   servers,
-		logger:    logger,
-		client:    &http.Client{Timeout: 30 * time.Second},
-		states:    make(map[string]oauthState),
+		store:      store,
+		secretMgr:  secretMgr,
+		publicURL:  publicURL,
+		servers:    servers,
+		logger:     logger,
+		client:     &http.Client{Timeout: 30 * time.Second},
+		states:     make(map[string]oauthState),
+		discovered: make(map[string]*DiscoveredOAuth),
 	}
 }
 
@@ -83,6 +119,192 @@ func pkceChallenge(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
+// DiscoverUpstreamOAuth probes an upstream MCP server for RFC 9728 and RFC 8414 metadata.
+func (m *OAuthManager) DiscoverUpstreamOAuth(ctx context.Context, serverName, serverURL, wwwAuthHeader string) (*DiscoveredOAuth, error) {
+	m.discoveredMu.RLock()
+	if existing, found := m.discovered[serverName]; found && existing != nil {
+		m.discoveredMu.RUnlock()
+		return existing, nil
+	}
+	m.discoveredMu.RUnlock()
+
+	// 1. Determine PRM URL
+	prmURL := ""
+	if wwwAuthHeader != "" {
+		if idx := strings.Index(wwwAuthHeader, "resource_metadata=\""); idx != -1 {
+			sub := wwwAuthHeader[idx+len("resource_metadata=\""):]
+			if endIdx := strings.Index(sub, "\""); endIdx != -1 {
+				prmURL = sub[:endIdx]
+			}
+		}
+	}
+
+	if prmURL == "" {
+		parsed, err := url.Parse(serverURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid server URL %q: %w", serverURL, err)
+		}
+		prmURL = fmt.Sprintf("%s://%s/.well-known/oauth-protected-resource", parsed.Scheme, parsed.Host)
+	}
+
+	m.logger.Info("probing upstream protected resource metadata", "server", serverName, "url", prmURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, prmURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching protected resource metadata: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("protected resource metadata returned HTTP %d", resp.StatusCode)
+	}
+
+	var prm protectedResourceMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&prm); err != nil {
+		return nil, fmt.Errorf("decoding protected resource metadata: %w", err)
+	}
+
+	if len(prm.AuthorizationServers) == 0 {
+		return nil, fmt.Errorf("protected resource metadata listed no authorization servers")
+	}
+
+	asURL := prm.AuthorizationServers[0]
+	m.logger.Info("discovered authorization server for upstream", "server", serverName, "as_url", asURL)
+
+	// 2. Fetch Authorization Server Metadata (RFC 8414)
+	asMetaURL := strings.TrimSuffix(asURL, "/") + "/.well-known/oauth-authorization-server"
+	asReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, asMetaURL, nil)
+	asReq.Header.Set("Accept", "application/json")
+
+	asResp, asErr := m.client.Do(asReq)
+	var asMeta authServerMetadata
+	if asErr == nil && asResp.StatusCode == http.StatusOK {
+		_ = json.NewDecoder(asResp.Body).Decode(&asMeta)
+		asResp.Body.Close()
+	} else {
+		if asResp != nil {
+			asResp.Body.Close()
+		}
+		// Fallback to OpenID configuration
+		oidcMetaURL := strings.TrimSuffix(asURL, "/") + "/.well-known/openid-configuration"
+		oidcReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, oidcMetaURL, nil)
+		oidcReq.Header.Set("Accept", "application/json")
+		if oidcResp, oidcErr := m.client.Do(oidcReq); oidcErr == nil && oidcResp.StatusCode == http.StatusOK {
+			_ = json.NewDecoder(oidcResp.Body).Decode(&asMeta)
+			oidcResp.Body.Close()
+		}
+	}
+
+	if asMeta.AuthorizationEndpoint == "" || asMeta.TokenEndpoint == "" {
+		return nil, fmt.Errorf("authorization server %q did not advertise authorization_endpoint or token_endpoint", asURL)
+	}
+
+	disc := &DiscoveredOAuth{
+		ServerName:          serverName,
+		ResourceMetadataURL: prmURL,
+		AuthServerURL:       asURL,
+		AuthURL:             asMeta.AuthorizationEndpoint,
+		TokenURL:            asMeta.TokenEndpoint,
+		RegistrationURL:     asMeta.RegistrationEndpoint,
+		Scopes:              prm.ScopesSupported,
+	}
+
+	// 3. Dynamic Client Registration (RFC 7591) if supported
+	if asMeta.RegistrationEndpoint != "" {
+		callbackURL := fmt.Sprintf("%s/oauth/callback/%s", m.publicURL, url.PathEscape(serverName))
+		dcrPayload := map[string]any{
+			"client_name":    "mcp-search-proxy",
+			"redirect_uris":  []string{callbackURL},
+			"grant_types":    []string{"authorization_code", "refresh_token"},
+			"response_types": []string{"code"},
+		}
+		dcrBody, _ := json.Marshal(dcrPayload)
+		dcrReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, asMeta.RegistrationEndpoint, strings.NewReader(string(dcrBody)))
+		dcrReq.Header.Set("Content-Type", "application/json")
+		dcrReq.Header.Set("Accept", "application/json")
+
+		if dcrResp, dcrErr := m.client.Do(dcrReq); dcrErr == nil && (dcrResp.StatusCode == http.StatusOK || dcrResp.StatusCode == http.StatusCreated) {
+			var dcrResult dynamicClientRegistrationResponse
+			if err := json.NewDecoder(dcrResp.Body).Decode(&dcrResult); err == nil && dcrResult.ClientID != "" {
+				disc.ClientID = dcrResult.ClientID
+				disc.ClientSecret = dcrResult.ClientSecret
+				m.logger.Info("dynamically registered oauth client with upstream AS", "server", serverName, "client_id", disc.ClientID)
+			}
+			dcrResp.Body.Close()
+		}
+	}
+
+	m.discoveredMu.Lock()
+	m.discovered[serverName] = disc
+	m.discoveredMu.Unlock()
+
+	return disc, nil
+}
+
+func (m *OAuthManager) getEffectiveOAuthConfig(ctx context.Context, serverName string) (*OAuthServerConfig, error) {
+	m.statesMu.Lock()
+	srv, ok := m.servers[serverName]
+	m.statesMu.Unlock()
+
+	// If explicit OAuth2 config is present and complete, use it
+	if ok && srv.OAuth2 != nil && srv.OAuth2.AuthURL != "" && srv.OAuth2.TokenURL != "" {
+		return srv.OAuth2, nil
+	}
+
+	// Otherwise check discovered config
+	m.discoveredMu.RLock()
+	disc, hasDisc := m.discovered[serverName]
+	m.discoveredMu.RUnlock()
+
+	if hasDisc && disc != nil && disc.AuthURL != "" && disc.TokenURL != "" {
+		return &OAuthServerConfig{
+			ClientID:     disc.ClientID,
+			ClientSecret: disc.ClientSecret,
+			AuthURL:      disc.AuthURL,
+			TokenURL:     disc.TokenURL,
+			Scopes:       disc.Scopes,
+		}, nil
+	}
+
+	// If server has a URL, try automatic discovery on the fly!
+	if ok && srv.GetURL() != "" {
+		disc, err := m.DiscoverUpstreamOAuth(ctx, serverName, srv.GetURL(), "")
+		if err == nil && disc != nil {
+			return &OAuthServerConfig{
+				ClientID:     disc.ClientID,
+				ClientSecret: disc.ClientSecret,
+				AuthURL:      disc.AuthURL,
+				TokenURL:     disc.TokenURL,
+				Scopes:       disc.Scopes,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("server %q has no oauth configuration and discovery failed", serverName)
+}
+
+// IsOAuthRequired returns true if the server is configured with or discovered to require OAuth.
+func (m *OAuthManager) IsOAuthRequired(serverName string) bool {
+	m.statesMu.Lock()
+	srv, ok := m.servers[serverName]
+	m.statesMu.Unlock()
+
+	if ok && (srv.AuthType == "oauth2_pkce_per_user" || (srv.OAuth2 != nil && srv.OAuth2.AuthURL != "")) {
+		return true
+	}
+
+	m.discoveredMu.RLock()
+	defer m.discoveredMu.RUnlock()
+	_, found := m.discovered[serverName]
+	return found
+}
+
 // GetConnectURL returns the browser authorization URL for a given server and caller.
 func (m *OAuthManager) GetConnectURL(serverName, caller string) string {
 	return fmt.Sprintf("%s/oauth/connect/%s?caller=%s", m.publicURL, url.PathEscape(serverName), url.QueryEscape(caller))
@@ -101,20 +323,18 @@ func (m *OAuthManager) HandleConnect(w http.ResponseWriter, r *http.Request) {
 		caller = "default"
 	}
 
-	m.statesMu.Lock()
-	srv, ok := m.servers[serverName]
-	m.statesMu.Unlock()
-
-	if !ok || srv.OAuth2 == nil || srv.OAuth2.AuthURL == "" || srv.OAuth2.TokenURL == "" {
-		http.Error(w, fmt.Sprintf("Server %q is not configured for OAuth2 delegation", serverName), http.StatusBadRequest)
+	ctx := r.Context()
+	oauthCfg, err := m.getEffectiveOAuthConfig(ctx, serverName)
+	if err != nil || oauthCfg.AuthURL == "" {
+		http.Error(w, fmt.Sprintf("Server %q OAuth resolution failed: %v", serverName, err), http.StatusBadRequest)
 		return
 	}
 
-	ctx := r.Context()
-	clientID, err := m.secretMgr.ResolveTemplate(ctx, srv.OAuth2.ClientID)
-	if err != nil || clientID == "" {
-		http.Error(w, fmt.Sprintf("Failed to resolve client_id for server %q: %v", serverName, err), http.StatusInternalServerError)
-		return
+	clientID := oauthCfg.ClientID
+	if clientID != "" {
+		if resolved, err := m.secretMgr.ResolveTemplate(ctx, clientID); err == nil && resolved != "" {
+			clientID = resolved
+		}
 	}
 
 	stateNonce := generateRandomString(32)
@@ -140,24 +360,25 @@ func (m *OAuthManager) HandleConnect(w http.ResponseWriter, r *http.Request) {
 
 	callbackURL := fmt.Sprintf("%s/oauth/callback/%s", m.publicURL, url.PathEscape(serverName))
 
-	authURL, err := url.Parse(srv.OAuth2.AuthURL)
+	authURL, err := url.Parse(oauthCfg.AuthURL)
 	if err != nil {
-		http.Error(w, "Invalid auth_url in server config", http.StatusInternalServerError)
+		http.Error(w, "Invalid auth_url for server", http.StatusInternalServerError)
 		return
 	}
 
 	q := authURL.Query()
 	q.Set("response_type", "code")
-	q.Set("client_id", clientID)
+	if clientID != "" {
+		q.Set("client_id", clientID)
+	}
 	q.Set("redirect_uri", callbackURL)
 	q.Set("state", stateNonce)
 	q.Set("code_challenge", challenge)
 	q.Set("code_challenge_method", "S256")
-	if len(srv.OAuth2.Scopes) > 0 {
-		q.Set("scope", strings.Join(srv.OAuth2.Scopes, " "))
+	if len(oauthCfg.Scopes) > 0 {
+		q.Set("scope", strings.Join(oauthCfg.Scopes, " "))
 	}
-	// For Google OAuth, request refresh token explicitly
-	if strings.Contains(srv.OAuth2.AuthURL, "google") {
+	if strings.Contains(oauthCfg.AuthURL, "google") {
 		q.Set("access_type", "offline")
 		q.Set("prompt", "consent")
 	}
@@ -193,21 +414,32 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if exists {
 		delete(m.states, stateNonce)
 	}
-	srv, srvExists := m.servers[serverName]
 	m.statesMu.Unlock()
 
 	if !exists || st.Server != serverName {
 		http.Error(w, "Invalid or expired OAuth state parameter (CSRF protection)", http.StatusForbidden)
 		return
 	}
-	if !srvExists || srv.OAuth2 == nil {
-		http.Error(w, "Server configuration not found", http.StatusInternalServerError)
+
+	ctx := r.Context()
+	oauthCfg, err := m.getEffectiveOAuthConfig(ctx, serverName)
+	if err != nil || oauthCfg.TokenURL == "" {
+		http.Error(w, fmt.Sprintf("OAuth configuration for server %q not found: %v", serverName, err), http.StatusInternalServerError)
 		return
 	}
 
-	ctx := r.Context()
-	clientID, _ := m.secretMgr.ResolveTemplate(ctx, srv.OAuth2.ClientID)
-	clientSecret, _ := m.secretMgr.ResolveTemplate(ctx, srv.OAuth2.ClientSecret)
+	clientID := oauthCfg.ClientID
+	if clientID != "" {
+		if resolved, err := m.secretMgr.ResolveTemplate(ctx, clientID); err == nil && resolved != "" {
+			clientID = resolved
+		}
+	}
+	clientSecret := oauthCfg.ClientSecret
+	if clientSecret != "" {
+		if resolved, err := m.secretMgr.ResolveTemplate(ctx, clientSecret); err == nil && resolved != "" {
+			clientSecret = resolved
+		}
+	}
 
 	callbackURL := fmt.Sprintf("%s/oauth/callback/%s", m.publicURL, url.PathEscape(serverName))
 
@@ -215,13 +447,15 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", callbackURL)
-	form.Set("client_id", clientID)
+	if clientID != "" {
+		form.Set("client_id", clientID)
+	}
 	if clientSecret != "" {
 		form.Set("client_secret", clientSecret)
 	}
 	form.Set("code_verifier", st.CodeVerifier)
 
-	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.OAuth2.TokenURL, strings.NewReader(form.Encode()))
+	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthCfg.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Creating token request failed: %v", err), http.StatusInternalServerError)
 		return
@@ -268,8 +502,8 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	var scopes []string
 	if tokenResp.Scope != "" {
 		scopes = strings.Fields(tokenResp.Scope)
-	} else {
-		scopes = srv.OAuth2.Scopes
+	} else if oauthCfg != nil {
+		scopes = oauthCfg.Scopes
 	}
 
 	tokenSet := &TokenSet{
@@ -324,26 +558,35 @@ func (m *OAuthManager) RefreshToken(ctx context.Context, user, serverName string
 		return nil, fmt.Errorf("server %q for user %q has no refresh_token; user must re-authenticate", serverName, user)
 	}
 
-	m.statesMu.Lock()
-	srv, ok := m.servers[serverName]
-	m.statesMu.Unlock()
-
-	if !ok || srv.OAuth2 == nil || srv.OAuth2.TokenURL == "" {
-		return nil, fmt.Errorf("server %q is not configured with an oauth2 token_url", serverName)
+	oauthCfg, err := m.getEffectiveOAuthConfig(ctx, serverName)
+	if err != nil || oauthCfg.TokenURL == "" {
+		return nil, fmt.Errorf("server %q is not configured with an oauth2 token_url: %w", serverName, err)
 	}
 
-	clientID, _ := m.secretMgr.ResolveTemplate(ctx, srv.OAuth2.ClientID)
-	clientSecret, _ := m.secretMgr.ResolveTemplate(ctx, srv.OAuth2.ClientSecret)
+	clientID := oauthCfg.ClientID
+	if clientID != "" {
+		if resolved, err := m.secretMgr.ResolveTemplate(ctx, clientID); err == nil && resolved != "" {
+			clientID = resolved
+		}
+	}
+	clientSecret := oauthCfg.ClientSecret
+	if clientSecret != "" {
+		if resolved, err := m.secretMgr.ResolveTemplate(ctx, clientSecret); err == nil && resolved != "" {
+			clientSecret = resolved
+		}
+	}
 
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", current.RefreshToken)
-	form.Set("client_id", clientID)
+	if clientID != "" {
+		form.Set("client_id", clientID)
+	}
 	if clientSecret != "" {
 		form.Set("client_secret", clientSecret)
 	}
 
-	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.OAuth2.TokenURL, strings.NewReader(form.Encode()))
+	tokenReq, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthCfg.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("creating refresh request: %w", err)
 	}

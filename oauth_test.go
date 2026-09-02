@@ -134,3 +134,83 @@ func TestOAuthLifecycle(t *testing.T) {
 		t.Fatalf("expected store to contain refreshed token, got: %s", tokenAfterRefresh.AccessToken)
 	}
 }
+
+func TestDynamicUpstreamDiscovery(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tmpDir, err := os.MkdirTemp("", "oauth_disc_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	vaultStore, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-1234")
+	secretMgr := NewSecretManager(1 * time.Minute)
+
+	// Mock Upstream Authorization Server (e.g. Okta / Keycloak)
+	var mockAS *httptest.Server
+	mockAS = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/.well-known/oauth-authorization-server" {
+			_ = json.NewEncoder(w).Encode(authServerMetadata{
+				Issuer:                mockAS.URL,
+				AuthorizationEndpoint: mockAS.URL + "/oauth2/authorize",
+				TokenEndpoint:         mockAS.URL + "/oauth2/token",
+				RegistrationEndpoint:  mockAS.URL + "/oauth2/register",
+				ScopesSupported:       []string{"read", "write"},
+			})
+			return
+		}
+		if r.URL.Path == "/oauth2/register" {
+			_ = json.NewEncoder(w).Encode(dynamicClientRegistrationResponse{
+				ClientID:     "dyn_client_id_okta_999",
+				ClientSecret: "dyn_client_secret_xyz",
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockAS.Close()
+
+	// Mock Remote Upstream MCP Server (e.g. NerdOracle / Atlassian)
+	mockMCPServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/.well-known/oauth-protected-resource" {
+			_ = json.NewEncoder(w).Encode(protectedResourceMetadata{
+				Resource:             "http://nerdoracle.internal/mcp",
+				AuthorizationServers: []string{mockAS.URL},
+				ScopesSupported:      []string{"openid", "profile", "nerdoracle:read"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockMCPServer.Close()
+
+	oauthMgr := NewOAuthManager(vaultStore, secretMgr, "http://localhost:8080", nil, logger)
+
+	// Proactively discover OAuth without ANY manual config!
+	disc, err := oauthMgr.DiscoverUpstreamOAuth(context.Background(), "nerdoracle", mockMCPServer.URL+"/mcp", "")
+	if err != nil {
+		t.Fatalf("dynamic discovery failed: %v", err)
+	}
+
+	if disc.AuthURL != mockAS.URL+"/oauth2/authorize" {
+		t.Fatalf("unexpected AuthURL: %s", disc.AuthURL)
+	}
+	if disc.TokenURL != mockAS.URL+"/oauth2/token" {
+		t.Fatalf("unexpected TokenURL: %s", disc.TokenURL)
+	}
+	if disc.ClientID != "dyn_client_id_okta_999" {
+		t.Fatalf("expected dynamic registration client ID, got: %s", disc.ClientID)
+	}
+	if !oauthMgr.IsOAuthRequired("nerdoracle") {
+		t.Fatal("expected IsOAuthRequired to return true for discovered server")
+	}
+
+	// Verify getEffectiveOAuthConfig uses the discovered config
+	eff, err := oauthMgr.getEffectiveOAuthConfig(context.Background(), "nerdoracle")
+	if err != nil || eff.AuthURL != mockAS.URL+"/oauth2/authorize" {
+		t.Fatalf("effective oauth config resolution failed: %v", err)
+	}
+}
+
