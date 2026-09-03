@@ -154,3 +154,25 @@ func TestGoogleGatewayVaultAuth(t *testing.T) {
 		t.Fatalf("expected isAuth=true for authenticated caller, got %v, err=%v", isAuth, err)
 	}
 }
+
+func TestGoogleAuthIsEmailAllowed(t *testing.T) {
+	cfg := &GoogleAuthConfig{
+		AllowedUsers: []string{"test@example.com", "user@domain.com"},
+	}
+	handler := &GoogleAuthHandler{cfg: cfg}
+
+	if !handler.isEmailAllowed("test@example.com") {
+		t.Errorf("expected test@example.com to be allowed")
+	}
+	if !handler.isEmailAllowed("user@domain.com") {
+		t.Errorf("expected user@domain.com to be allowed")
+	}
+	if handler.isEmailAllowed("user@other.com") {
+		t.Errorf("expected user@other.com to be denied")
+	}
+
+	handlerAll := &GoogleAuthHandler{cfg: &GoogleAuthConfig{AllowedUsers: []string{"*"}}}
+	if !handlerAll.isEmailAllowed("anyone@anywhere.com") {
+		t.Errorf("expected * to allow all")
+	}
+}

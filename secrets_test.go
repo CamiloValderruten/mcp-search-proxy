@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -73,5 +74,31 @@ func TestPluggableCustomProvider(t *testing.T) {
 	}
 	if val != "custom-resolved-secret" {
 		t.Fatalf("expected 'custom-resolved-secret', got: %s", val)
+	}
+}
+func TestSecretsResolveTemplate(t *testing.T) {
+	mgr := NewSecretManager(1 * time.Minute)
+	// mock file secret
+	tmp, _ := os.MkdirTemp("", "secrets_*")
+	defer os.RemoveAll(tmp)
+	secretPath := filepath.Join(tmp, "secret.txt")
+	os.WriteFile(secretPath, []byte("file-secret"), 0644)
+	
+	os.Setenv("TEST_ENV_SEC", "env-secret")
+	defer os.Unsetenv("TEST_ENV_SEC")
+
+	res, _ := mgr.ResolveTemplate(context.Background(), "Bearer file://" + secretPath)
+	if res != "Bearer file-secret" {
+		t.Errorf("Expected Bearer file-secret, got %s", res)
+	}
+
+	res, _ = mgr.ResolveTemplate(context.Background(), "env://TEST_ENV_SEC")
+	if res != "env-secret" {
+		t.Errorf("Expected env-secret, got %s", res)
+	}
+
+	res, _ = mgr.ResolveTemplate(context.Background(), "plain text")
+	if res != "plain text" {
+		t.Errorf("Expected plain text, got %s", res)
 	}
 }

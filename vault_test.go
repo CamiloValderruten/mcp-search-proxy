@@ -100,3 +100,17 @@ func TestEncryptedFileTokenStore(t *testing.T) {
 		t.Fatalf("expected ErrTokenNotFound after delete, got: %v", err)
 	}
 }
+func TestVaultCorruptedFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultPath := filepath.Join(tmpDir, "vault.enc")
+	
+	// Create a corrupted vault
+	os.WriteFile(vaultPath, []byte("this is not valid encrypted data"), 0600)
+
+	_, err := NewEncryptedFileTokenStore(vaultPath, "1234567890123456")
+	if err == nil {
+		t.Errorf("Expected error loading corrupted vault")
+	}
+}
+
+

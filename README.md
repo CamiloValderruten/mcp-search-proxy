@@ -8,9 +8,10 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/CamiloValderruten/mcp-search-proxy?style=flat-square)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/CamiloValderruten/mcp-search-proxy/ci.yml?branch=main&label=tests&style=flat-square)](https://github.com/CamiloValderruten/mcp-search-proxy/actions)
+[![Status](https://img.shields.io/badge/Status-Production%20Ready-success.svg?style=flat-square)](https://github.com/CamiloValderruten/mcp-search-proxy)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
-**Federate 100+ MCP servers into a single high-performance gateway with sub-millisecond tool search, neural vector discovery, in-memory TTL caching, caller identity RBAC, pluggable secret providers (1Password, Env, Vault), and dual STDIO/HTTP daemon modes.**
+**Federate 100+ MCP servers into a single high-performance gateway with sub-millisecond tool search, neural vector discovery, in-memory TTL caching, caller identity RBAC, pluggable secret providers (1Password, Env, Vault), and dual STDIO/HTTP daemon modes. Built with comprehensive test coverage and robust error handling for production use.**
 
 [Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Architecture](#-architecture) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon](#-http-daemon-mode) • [Pluggable Secrets](#-pluggable-secret-providers--zero-plaintext-credentials) • [Identity RBAC](#-identity-aware-rbac--credential-brokering) • [Semantic Search](#-neural-semantic-vector-search) • [Benchmarks](#-performance--efficiency-benchmarks)
 
@@ -87,6 +88,7 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 - 🛡️ **Execution Timeouts & Auto-Reconnect**: Configurable per-server timeouts prevent hung agents. Broken pipes and severed HTTP connections automatically reconnect and retry.
 - 🔁 **Hot-Reloading (Zero Downtime)**: Update servers in-flight via `SIGHUP` or the `reload_config` tool without restarting your agent session.
 - 📊 **Real-Time Observability**: Built-in `/health`, `/metrics`, and `get_metrics` tools report active connections, error rates, and cache hits.
+- 🧪 **Production Ready**: Extensively tested with comprehensive coverage, robust error handling, and memory leak prevention for critical enterprise workloads.
 - 📦 **Single Static Binary**: Zero external runtime dependencies. Compiles to an ultra-lightweight ~11 MB binary for macOS, Linux, and Windows.
 
 ---

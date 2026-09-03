@@ -214,3 +214,61 @@ func TestDynamicUpstreamDiscovery(t *testing.T) {
 	}
 }
 
+func TestOAuthUpdateServers(t *testing.T) {
+	mgr := NewOAuthManager(nil, nil, "http://localhost", nil, slog.Default())
+	servers := map[string]ServerConfig{"test-server": {AuthType: "oauth2_pkce_per_user"}}
+	mgr.UpdateServers(servers)
+	
+	if len(mgr.servers) != 1 {
+		t.Errorf("Expected 1 server, got %d", len(mgr.servers))
+	}
+	if mgr.servers["test-server"].AuthType != "oauth2_pkce_per_user" {
+		t.Errorf("Expected oauth2_pkce_per_user")
+	}
+}
+
+func TestOAuthHandleStatus(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "oauth_status_test_*")
+	defer os.RemoveAll(tmpDir)
+	store, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-1234")
+	store.Put(context.Background(), "user1", "test-server", &TokenSet{AccessToken: "token"})
+
+	servers := map[string]ServerConfig{"test-server": {AuthType: "oauth2_pkce_per_user"}}
+	mgr := NewOAuthManager(store, nil, "http://localhost", servers, slog.Default())
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth/status?user=user1", nil)
+	rec := httptest.NewRecorder()
+	mgr.HandleStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("Expected 200 OK, got %d", rec.Code)
+	}
+	var resp map[string]any
+	json.NewDecoder(rec.Body).Decode(&resp)
+	conns, ok := resp["connections"].([]any)
+	if !ok || len(conns) == 0 {
+		t.Errorf("Expected connections array, got %v", resp)
+	}
+}
+
+func TestOAuthHandleDisconnect(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "oauth_disc_test_*")
+	defer os.RemoveAll(tmpDir)
+	store, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-1234")
+	store.Put(context.Background(), "user1", "test-server", &TokenSet{AccessToken: "token"})
+
+	mgr := NewOAuthManager(store, nil, "http://localhost", nil, slog.Default())
+
+	req := httptest.NewRequest(http.MethodPost, "/oauth/disconnect/test-server?user=user1", nil)
+	rec := httptest.NewRecorder()
+	mgr.HandleDisconnect(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("Expected 200 OK, got %d", rec.Code)
+	}
+
+	_, err := store.Get(context.Background(), "user1", "test-server")
+	if err == nil {
+		t.Errorf("Expected error after deletion")
+	}
+}
