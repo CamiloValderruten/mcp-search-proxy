@@ -244,7 +244,7 @@ func TestOAuthHandleStatus(t *testing.T) {
 		t.Errorf("Expected 200 OK, got %d", rec.Code)
 	}
 	var resp map[string]any
-	json.NewDecoder(rec.Body).Decode(&resp)
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
 	conns, ok := resp["connections"].([]any)
 	if !ok || len(conns) == 0 {
 		t.Errorf("Expected connections array, got %v", resp)
