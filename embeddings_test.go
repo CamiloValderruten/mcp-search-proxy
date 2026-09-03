@@ -56,7 +56,7 @@ func TestEmbedderEmbed(t *testing.T) {
 		}
 		
 		var req openAIEmbeddingRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		
 		if len(req.Input) == 0 {
 			w.WriteHeader(http.StatusBadRequest)
@@ -69,7 +69,7 @@ func TestEmbedderEmbed(t *testing.T) {
 				{Index: 1, Embedding: []float32{0.3, 0.4}},
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer mockServer.Close()
 

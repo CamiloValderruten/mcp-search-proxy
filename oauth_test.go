@@ -231,7 +231,7 @@ func TestOAuthHandleStatus(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "oauth_status_test_*")
 	defer os.RemoveAll(tmpDir)
 	store, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-1234")
-	store.Put(context.Background(), "user1", "test-server", &TokenSet{AccessToken: "token"})
+	_ = store.Put(context.Background(), "user1", "test-server", &TokenSet{AccessToken: "token"})
 
 	servers := map[string]ServerConfig{"test-server": {AuthType: "oauth2_pkce_per_user"}}
 	mgr := NewOAuthManager(store, nil, "http://localhost", servers, slog.Default())
@@ -255,7 +255,7 @@ func TestOAuthHandleDisconnect(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "oauth_disc_test_*")
 	defer os.RemoveAll(tmpDir)
 	store, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-1234")
-	store.Put(context.Background(), "user1", "test-server", &TokenSet{AccessToken: "token"})
+	_ = store.Put(context.Background(), "user1", "test-server", &TokenSet{AccessToken: "token"})
 
 	mgr := NewOAuthManager(store, nil, "http://localhost", nil, slog.Default())
 

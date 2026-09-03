@@ -109,15 +109,15 @@ func TestConfigLoadConfig(t *testing.T) {
 		}
 	}`
 	validPath := filepath.Join(tmp, "valid.json")
-	os.WriteFile(validPath, []byte(validJSON), 0644)
+	_ = os.WriteFile(validPath, []byte(validJSON), 0644)
 
 	invalidJSON := `{ "mcpServers": }`
 	invalidPath := filepath.Join(tmp, "invalid.json")
-	os.WriteFile(invalidPath, []byte(invalidJSON), 0644)
+	_ = os.WriteFile(invalidPath, []byte(invalidJSON), 0644)
 
 	noServersJSON := `{}`
 	noServersPath := filepath.Join(tmp, "noservers.json")
-	os.WriteFile(noServersPath, []byte(noServersJSON), 0644)
+	_ = os.WriteFile(noServersPath, []byte(noServersJSON), 0644)
 
 	cfg, err := LoadConfig(validPath)
 	if err != nil {

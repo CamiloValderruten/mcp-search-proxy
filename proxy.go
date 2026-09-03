@@ -193,7 +193,7 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 		wg.Add(1)
 		go func(serverName string, s ServerConfig) {
 			defer wg.Done()
-			p.initSingleUpstream(ctx, serverName, s)
+			_, _ = p.initSingleUpstream(ctx, serverName, s)
 		}(name, srv)
 	}
 
@@ -267,9 +267,7 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 
 	if srv.Command != "" {
 		var envSlice []string
-		for _, e := range os.Environ() {
-			envSlice = append(envSlice, e)
-		}
+		envSlice = append(envSlice, os.Environ()...)
 		for k, v := range srv.Env {
 			envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 		}

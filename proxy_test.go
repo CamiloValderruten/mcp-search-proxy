@@ -303,7 +303,7 @@ func TestProxyReloadConfig(t *testing.T) {
 		MCPServers: map[string]ServerConfig{},
 	}
 	// just test it does not panic
-	p.ReloadConfig(context.Background(), cfg)
+	_ = p.ReloadConfig(context.Background(), cfg)
 	
 	if len(p.clients) != 0 {
 		t.Errorf("Expected clients to be empty")
@@ -337,5 +337,5 @@ func TestProxyInitUpstreams(t *testing.T) {
 	
 	// This will start it and fail fast since echo exits immediately,
 	// but it gets coverage.
-	p.InitUpstreams(context.Background(), cfg)
+	_ = p.InitUpstreams(context.Background(), cfg)
 }
