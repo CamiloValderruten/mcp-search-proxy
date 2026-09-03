@@ -82,7 +82,7 @@ func TestSecretsResolveTemplate(t *testing.T) {
 	tmp, _ := os.MkdirTemp("", "secrets_*")
 	defer os.RemoveAll(tmp)
 	secretPath := filepath.Join(tmp, "secret.txt")
-	os.WriteFile(secretPath, []byte("file-secret"), 0644)
+	_ = os.WriteFile(secretPath, []byte("file-secret"), 0644)
 	
 	os.Setenv("TEST_ENV_SEC", "env-secret")
 	defer os.Unsetenv("TEST_ENV_SEC")

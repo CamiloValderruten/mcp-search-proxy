@@ -105,7 +105,7 @@ func TestVaultCorruptedFile(t *testing.T) {
 	vaultPath := filepath.Join(tmpDir, "vault.enc")
 	
 	// Create a corrupted vault
-	os.WriteFile(vaultPath, []byte("this is not valid encrypted data"), 0600)
+	_ = os.WriteFile(vaultPath, []byte("this is not valid encrypted data"), 0600)
 
 	_, err := NewEncryptedFileTokenStore(vaultPath, "1234567890123456")
 	if err == nil {
