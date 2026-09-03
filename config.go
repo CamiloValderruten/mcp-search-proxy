@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -17,10 +18,12 @@ type ServerConfig struct {
 	Headers      map[string]string `json:"headers,omitempty"`
 	Description  string            `json:"description,omitempty"`
 	Timeout      string            `json:"timeout,omitempty"`      // e.g. "30s", "1m"
-	CacheTTL     string            `json:"cache_ttl,omitempty"`    // e.g. "5m", "1h"
-	ReadOnly     bool              `json:"read_only,omitempty"`    // Blocks write/destructive mutations
-	AllowedTools []string          `json:"allowed_tools,omitempty"`// Whitelist glob patterns
-	BlockedTools []string          `json:"blocked_tools,omitempty"`// Blacklist glob patterns
+	CacheTTL     string             `json:"cache_ttl,omitempty"`    // e.g. "5m", "1h"
+	ReadOnly     bool               `json:"read_only,omitempty"`    // Blocks write/destructive mutations
+	AllowedTools []string           `json:"allowed_tools,omitempty"`// Whitelist glob patterns
+	BlockedTools []string           `json:"blocked_tools,omitempty"`// Blacklist glob patterns
+	AuthType     string             `json:"auth_type,omitempty"`    // "bearer_token" (default) or "oauth2_pkce_per_user"
+	OAuth2       *OAuthServerConfig `json:"oauth2,omitempty"`       // Upstream OAuth 2.0 configuration
 }
 
 // GetURL returns either URL or ServerURL.
@@ -57,6 +60,7 @@ func (s *ServerConfig) GetCacheTTL() time.Duration {
 
 // IdentityConfig defines RBAC, upstream identity mappings, and dynamic credentials for a caller client.
 type IdentityConfig struct {
+	Emails          []string                     `json:"emails,omitempty"`            // Whitelist of allowed emails/aliases
 	Token           string                       `json:"token,omitempty"`             // Bearer token for HTTP auth
 	AllowedServers  []string                     `json:"allowed_servers,omitempty"`   // Whitelist of server names (supports "*")
 	AllowedTools    []string                     `json:"allowed_tools,omitempty"`     // Whitelist of tool names/globs (supports "*")
@@ -66,6 +70,31 @@ type IdentityConfig struct {
 	UpstreamHeaders map[string]map[string]string `json:"upstream_headers,omitempty"`  // Map upstream server -> headers with secret URIs (e.g. op://, env://)
 }
 
+// MatchesEmail checks if a given email matches the identity's configured emails or identity key.
+func (c IdentityConfig) MatchesEmail(id, email string) bool {
+	if email == "" {
+		return false
+	}
+	for _, e := range c.Emails {
+		if strings.EqualFold(e, email) {
+			return true
+		}
+	}
+	if strings.EqualFold(id, email) || strings.HasPrefix(strings.ToLower(email), strings.ToLower(id)) {
+		return true
+	}
+	return false
+}
+
+// OAuthServerConfig defines upstream OAuth 2.0 configuration for user delegation.
+type OAuthServerConfig struct {
+	ClientID     string   `json:"client_id,omitempty"`
+	ClientSecret string   `json:"client_secret,omitempty"`
+	AuthURL      string   `json:"auth_url,omitempty"`
+	TokenURL     string   `json:"token_url,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+}
+
 // EmbeddingsConfig defines optional OpenAI-compatible vector embeddings for semantic search.
 type EmbeddingsConfig struct {
 	APIKey string `json:"apiKey,omitempty"` // OpenAI API Key (or env var OPENAI_API_KEY)
@@ -73,11 +102,24 @@ type EmbeddingsConfig struct {
 	URL    string `json:"url,omitempty"`    // Default: https://api.openai.com/v1/embeddings
 }
 
+// GoogleAuthConfig defines inbound "Sign in with Google" settings for the proxy gateway.
+type GoogleAuthConfig struct {
+	ClientID     string   `json:"clientId,omitempty"`
+	ClientSecret string   `json:"clientSecret,omitempty"`
+	KeyFile      string   `json:"keyFile,omitempty"`      // Path to GCP OAuth client json file (e.g. gcp-oauth.keys.json)
+	RedirectURL  string   `json:"redirectUrl,omitempty"`  // e.g. "http://localhost:8080/auth/callback"
+	AllowedUsers []string `json:"allowedUsers,omitempty"` // Whitelist of allowed emails, or "*"
+}
+
 // SettingsConfig defines global proxy options.
 type SettingsConfig struct {
-	DefaultTimeout string `json:"defaultTimeout,omitempty"` // Default "60s"
-	AuthKey        string `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
-	OpenAIKey      string `json:"openAIKey,omitempty"`      // Alternative shorthand for embeddings API key
+	DefaultTimeout string            `json:"defaultTimeout,omitempty"` // Default "60s"
+	AuthKey        string            `json:"authKey,omitempty"`        // Global master auth key for HTTP mode
+	OpenAIKey      string            `json:"openAIKey,omitempty"`      // Alternative shorthand for embeddings API key
+	VaultPath      string            `json:"vaultPath,omitempty"`      // Path to encrypted vault file (default: ~/.config/mcp-search-proxy/vault.enc)
+	VaultKey       string            `json:"vaultKey,omitempty"`       // Master key or secret URI (e.g. op://..., env://...) for vault
+	PublicURL      string            `json:"publicUrl,omitempty"`      // Base public URL for OAuth callbacks (e.g. "http://localhost:8080")
+	GoogleAuth     *GoogleAuthConfig `json:"googleAuth,omitempty"`     // Inbound Google OAuth configuration
 }
 
 // Config wraps the top-level MCP servers configuration.

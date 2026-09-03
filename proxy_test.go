@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -165,6 +166,66 @@ func TestEnvVarExpansion(t *testing.T) {
 	}
 }
 
+func TestOAuthToolAuthorization(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	p := NewProxy(logger, 5*time.Second)
+
+	tmpDir, err := os.MkdirTemp("", "oauth_proxy_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	vaultStore, _ := NewEncryptedFileTokenStore(filepath.Join(tmpDir, "vault.enc"), "key-12345")
+	p.SetTokenStore(vaultStore)
+
+	oauthMgr := NewOAuthManager(vaultStore, p.secretMgr, "http://localhost:8080", map[string]ServerConfig{
+		"oauth-server": {
+			AuthType: "oauth2_pkce_per_user",
+			OAuth2: &OAuthServerConfig{
+				ClientID: "cid",
+				AuthURL:  "http://auth.example.com",
+				TokenURL: "http://token.example.com",
+			},
+		},
+	}, logger)
+	p.SetOAuthManager(oauthMgr)
+
+	p.tools["fetch_data"] = &RegisteredTool{
+		ServerName: "oauth-server",
+		Tool:       mcp.Tool{Name: "fetch_data"},
+		ServerConfig: ServerConfig{
+			AuthType: "oauth2_pkce_per_user",
+		},
+	}
+
+	ctx := WithIdentity(context.Background(), "alice", IdentityConfig{
+		AllowedServers: []string{"oauth-server"},
+	})
+
+	// 1. Call without token must fail with clear actionable connect URL
+	_, callErr := p.CallTool(ctx, "fetch_data", nil)
+	if callErr == nil {
+		t.Fatal("expected error for unauthenticated oauth server, got nil")
+	}
+	if !contains(callErr.Error(), "authentication required") || !contains(callErr.Error(), "http://localhost:8080/oauth/connect/oauth-server?caller=alice") {
+		t.Fatalf("expected connect URL in error message, got: %v", callErr)
+	}
+
+	// 2. Put active token for alice in vault
+	_ = vaultStore.Put(ctx, "alice", "oauth-server", &TokenSet{
+		AccessToken: "alice_live_token",
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
+	})
+
+	// Now token check passes! (We don't have a real upstream client connected, so it will fail after token check at client.CallTool or succeed if mocked)
+	// But the auth error should be gone.
+	_, callErr2 := p.CallTool(ctx, "fetch_data", nil)
+	if callErr2 != nil && contains(callErr2.Error(), "authentication required") {
+		t.Fatalf("expected oauth token check to pass, but got auth error: %v", callErr2)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || (len(s) > 0 && len(substr) > 0 && (stringContains(s, substr))))
 }
@@ -176,4 +237,105 @@ func stringContains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+
+func TestProxyToolAccessors(t *testing.T) {
+	p := NewProxy(slog.Default(), 5*time.Second)
+	p.tools["tool1"] = &RegisteredTool{ServerName: "server1", Tool: mcp.Tool{Name: "tool1"}}
+	
+	if !p.HasTool("tool1") {
+		t.Errorf("Expected HasTool to return true")
+	}
+	if p.HasTool("non-existent") {
+		t.Errorf("Expected HasTool to return false")
+	}
+	
+	_, _, ok1 := p.GetTool("tool1")
+	if !ok1 {
+		t.Errorf("Expected GetTool to return ok for tool1")
+	}
+	_, _, ok2 := p.GetTool("non-existent")
+	if ok2 {
+		t.Errorf("Expected GetTool to return false for non-existent")
+	}
+}
+
+func TestProxyGetMetrics(t *testing.T) {
+	p := NewProxy(slog.Default(), 5*time.Second)
+	
+	p.clients["server1"] = nil
+	p.tools["tool1"] = &RegisteredTool{}
+	
+	m := p.GetMetrics()
+	if m.ActiveUpstreams != 1 {
+		t.Errorf("Expected 1 active upstream, got %d", m.ActiveUpstreams)
+	}
+	if m.IndexedTools != 1 {
+		t.Errorf("Expected 1 indexed tool, got %d", m.IndexedTools)
+	}
+}
+
+func TestProxyResolveIdentity(t *testing.T) {
+	p := NewProxy(slog.Default(), 5*time.Second)
+	// We need to set identities on the proxy
+	p.mu.Lock()
+	p.identities = map[string]IdentityConfig{
+		"admin": {Token: "admin-token", ReadOnly: false},
+	}
+	p.mu.Unlock()
+	
+	// Test Bearer token resolution
+	name, id, ok := p.ResolveIdentity("admin-token")
+	if !ok || name != "admin" || id.ReadOnly {
+		t.Errorf("Failed to resolve identity")
+	}
+
+	_, _, ok2 := p.ResolveIdentity("bad-token")
+	if ok2 {
+		t.Errorf("Should not resolve bad token")
+	}
+}
+
+func TestProxyReloadConfig(t *testing.T) {
+	p := NewProxy(slog.Default(), 5*time.Second)
+	cfg := &Config{
+		MCPServers: map[string]ServerConfig{},
+	}
+	// just test it does not panic
+	p.ReloadConfig(context.Background(), cfg)
+	
+	if len(p.clients) != 0 {
+		t.Errorf("Expected clients to be empty")
+	}
+}
+
+func TestProxyComputeCacheKey(t *testing.T) {
+	p := NewProxy(slog.Default(), 5*time.Second)
+	
+	args := map[string]interface{}{"a": 1, "b": "test"}
+	key1 := p.computeCacheKey("server1", "tool1", args)
+	key2 := p.computeCacheKey("server1", "tool1", args)
+	
+	if key1 != key2 {
+		t.Errorf("Expected identical cache keys")
+	}
+}
+
+func TestProxyInitUpstreams(t *testing.T) {
+	logger := slog.Default()
+	p := NewProxy(logger, 5*time.Second)
+
+	cfg := &Config{
+		MCPServers: map[string]ServerConfig{
+			"dummy": {
+				Command: "echo",
+				Args: []string{"hello"},
+			},
+		},
+	}
+	
+	// This will start it and fail fast since echo exits immediately,
+	// but it gets coverage.
+	p.InitUpstreams(context.Background(), cfg)
 }

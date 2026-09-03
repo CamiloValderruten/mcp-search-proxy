@@ -121,6 +121,16 @@ func main() {
 		}
 	}()
 
+	var googleAuthHandler *GoogleAuthHandler
+	if cfg.Settings.GoogleAuth != nil {
+		gh, err := NewGoogleAuthHandler(cfg.Settings.GoogleAuth, proxy.secretMgr, cfg.Settings.PublicURL, proxy, logger)
+		if err != nil {
+			logger.Error("failed to initialize google authentication", "err", err)
+		} else {
+			googleAuthHandler = gh
+		}
+	}
+
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
@@ -133,6 +143,24 @@ func main() {
 		mcp.WithDescription("List all connected upstream MCP servers, descriptions, tool counts, and security policies accessible to your identity."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
+		}
+
 		servers := proxy.ListServers(ctx)
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("Connected Upstream Servers (%d):\n\n", len(servers)))
@@ -146,7 +174,13 @@ func main() {
 				roFlag = " `[read-only]`"
 			}
 			if srv.Status == "error" {
-				sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+				errLower := strings.ToLower(srv.Error)
+				if strings.Contains(errLower, "authorization") || strings.Contains(errLower, "unauthorized") {
+					connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, srv.Name, callerID)
+					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[requires authorization]`): %s\n  ⚠️ Action Required: Do NOT attempt alternative shell commands or look for credentials on disk.\n  Immediately tell the user to connect their account:\n  👉 %s\n", srv.Name, desc, connectURL))
+				} else {
+					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+				}
 			} else {
 				sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
 			}
@@ -161,11 +195,51 @@ func main() {
 		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
+		}
+
 		query, err := request.RequireString("query")
 		if err != nil {
 			return mcp.NewToolResultError("missing required parameter 'query'"), nil
 		}
 		summary := proxy.SearchToolsFormatConcise(ctx, query, 8)
+
+		proxy.mu.RLock()
+		var unauthServers []string
+		for sName, sErr := range proxy.serverErrors {
+			sErrLower := strings.ToLower(sErr)
+			if strings.Contains(sErrLower, "authorization") || strings.Contains(sErrLower, "unauthorized") {
+				unauthServers = append(unauthServers, sName)
+			}
+		}
+		proxy.mu.RUnlock()
+
+		if len(unauthServers) > 0 {
+			var authExtra strings.Builder
+			authExtra.WriteString(summary)
+			authExtra.WriteString("\n\n⚠️ Note: Some upstream servers require authorization and their tools are not yet indexed:\n")
+			for _, sName := range unauthServers {
+				connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, sName, callerID)
+				authExtra.WriteString(fmt.Sprintf("- **`%s`**: Do NOT attempt alternative shell commands or look for credentials on disk. Tell the user to connect:\n  👉 %s\n", sName, connectURL))
+			}
+			summary = authExtra.String()
+		}
+
 		return mcp.NewToolResultText(summary), nil
 	})
 
@@ -176,6 +250,24 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
+		}
+
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
 			return mcp.NewToolResultError("missing required parameter 'tool_name'"), nil
@@ -190,6 +282,28 @@ func main() {
 
 		res, err := proxy.CallTool(ctx, toolName, args)
 		if err != nil {
+			errLower := strings.ToLower(err.Error())
+			if strings.Contains(errLower, "not found") {
+				proxy.mu.RLock()
+				var unauthServers []string
+				for sName, sErr := range proxy.serverErrors {
+					sErrLower := strings.ToLower(sErr)
+					if strings.Contains(sErrLower, "authorization") || strings.Contains(sErrLower, "unauthorized") {
+						unauthServers = append(unauthServers, sName)
+					}
+				}
+				proxy.mu.RUnlock()
+
+				if len(unauthServers) > 0 {
+					var authMsg strings.Builder
+					authMsg.WriteString(fmt.Sprintf("%s\n\n⚠️ Note: The requested tool might belong to an upstream server that requires authorization and is not yet indexed:\n", err.Error()))
+					for _, sName := range unauthServers {
+						connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, sName, callerID)
+						authMsg.WriteString(fmt.Sprintf("- **`%s`**: Do NOT attempt alternative shell commands or look for credentials on disk. Tell the user to connect:\n  👉 %s\n", sName, connectURL))
+					}
+					return mcp.NewToolResultError(authMsg.String()), nil
+				}
+			}
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return res, nil
@@ -202,6 +316,23 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
 	)
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		callerID := ""
+		if ident := GetCallerIdentity(ctx); ident != nil {
+			callerID = ident.ID
+		}
+		if callerID == "" {
+			for id := range cfg.Identities {
+				callerID = id
+				break
+			}
+		}
+
+		if googleAuthHandler != nil {
+			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
+			if !isAuth {
+				return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
+			}
+		}
 		toolName, err := request.RequireString("tool_name")
 		if err != nil {
 			return mcp.NewToolResultError("missing parameter 'tool_name'"), nil
@@ -283,7 +414,15 @@ func main() {
 			_ = json.NewEncoder(w).Encode(m)
 		})
 
-		// 3. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
+		// 3. Optional Inbound Google OAuth Handler
+		if googleAuthHandler != nil {
+			mux.HandleFunc("/auth/login", googleAuthHandler.HandleLogin)
+			mux.HandleFunc("/auth/callback", googleAuthHandler.HandleCallback)
+			mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
+		}
+
+		// 4. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
 		handleMCP := func(w http.ResponseWriter, r *http.Request) {
 			reqCtx := r.Context()
 
@@ -298,13 +437,23 @@ func main() {
 				token = id
 			}
 
-			// Check global authKey if configured
-			if cfg.Settings.AuthKey != "" && token != cfg.Settings.AuthKey {
-				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
-					reqCtx = WithIdentity(reqCtx, id, identCfg)
-				} else {
-					http.Error(w, "Unauthorized: invalid bearer token or client identity", http.StatusUnauthorized)
-					return
+			// Check Google authentication first if active
+			if googleAuthHandler != nil {
+				if userEmail, ok := googleAuthHandler.AuthenticateRequest(r); ok {
+					callerID := userEmail
+					var identCfg IdentityConfig
+					for id, c := range cfg.Identities {
+						if c.MatchesEmail(id, userEmail) {
+							callerID = id
+							identCfg = c
+							break
+						}
+					}
+					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
+				} else if token != "" {
+					if id, identCfg, ok := proxy.ResolveIdentity(token); ok && identCfg.Token != "" {
+						reqCtx = WithIdentity(reqCtx, id, identCfg)
+					}
 				}
 			} else if token != "" {
 				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
@@ -317,6 +466,14 @@ func main() {
 
 		mux.HandleFunc("/mcp", handleMCP)
 		mux.HandleFunc("/mcp/", handleMCP)
+
+		// 5. OAuth2 Endpoints for Upstream Per-User Delegation
+		if proxy.OAuthManager() != nil {
+			mux.HandleFunc("/oauth/connect/", proxy.OAuthManager().HandleConnect)
+			mux.HandleFunc("/oauth/callback/", proxy.OAuthManager().HandleCallback)
+			mux.HandleFunc("/oauth/status", proxy.OAuthManager().HandleStatus)
+			mux.HandleFunc("/oauth/disconnect/", proxy.OAuthManager().HandleDisconnect)
+		}
 
 		httpServer := &http.Server{
 			Addr:         *listenAddr,

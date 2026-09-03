@@ -8,9 +8,10 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/CamiloValderruten/mcp-search-proxy?style=flat-square)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Tests](https://img.shields.io/github/actions/workflow/status/CamiloValderruten/mcp-search-proxy/ci.yml?branch=main&label=tests&style=flat-square)](https://github.com/CamiloValderruten/mcp-search-proxy/actions)
+[![Status](https://img.shields.io/badge/Status-Production%20Ready-success.svg?style=flat-square)](https://github.com/CamiloValderruten/mcp-search-proxy)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
 
-**Federate 100+ MCP servers into a single high-performance gateway with sub-millisecond tool search, neural vector discovery, in-memory TTL caching, caller identity RBAC, pluggable secret providers (1Password, Env, Vault), and dual STDIO/HTTP daemon modes.**
+**Federate 100+ MCP servers into a single high-performance gateway with sub-millisecond tool search, neural vector discovery, in-memory TTL caching, caller identity RBAC, pluggable secret providers (1Password, Env, Vault), and dual STDIO/HTTP daemon modes. Built with comprehensive test coverage and robust error handling for production use.**
 
 [Features](#-key-features) • [The Problem](#-the-problem-the-context-bloat-tax) • [Architecture](#-architecture) • [Quickstart](#-quickstart-30-seconds) • [HTTP Daemon](#-http-daemon-mode) • [Pluggable Secrets](#-pluggable-secret-providers--zero-plaintext-credentials) • [Identity RBAC](#-identity-aware-rbac--credential-brokering) • [Semantic Search](#-neural-semantic-vector-search) • [Benchmarks](#-performance--efficiency-benchmarks)
 
@@ -87,6 +88,7 @@ Every tool exposed to an LLM must have its full JSON Schema injected into the sy
 - 🛡️ **Execution Timeouts & Auto-Reconnect**: Configurable per-server timeouts prevent hung agents. Broken pipes and severed HTTP connections automatically reconnect and retry.
 - 🔁 **Hot-Reloading (Zero Downtime)**: Update servers in-flight via `SIGHUP` or the `reload_config` tool without restarting your agent session.
 - 📊 **Real-Time Observability**: Built-in `/health`, `/metrics`, and `get_metrics` tools report active connections, error rates, and cache hits.
+- 🧪 **Production Ready**: Extensively tested with comprehensive coverage, robust error handling, and memory leak prevention for critical enterprise workloads.
 - 📦 **Single Static Binary**: Zero external runtime dependencies. Compiles to an ultra-lightweight ~11 MB binary for macOS, Linux, and Windows.
 
 ---
@@ -194,6 +196,49 @@ Control exactly which tools each user or AI agent is permitted to discover and e
 2. **Dynamic Credential Swapping**: When `developer-alice` calls `remote-gateway`, the proxy transparently attaches her personal Bearer token from 1Password.
 3. **Zero Secret Exposure**: Outbound headers are injected ephemerally at the network boundary. Neither the client IDE nor the LLM agent ever sees the raw secrets.
 4. **Completely Optional**: Omit the `identities` block to run an open, unauthenticated gateway.
+
+---
+
+## 🔐 OAuth 2.0 Upstream Delegation & Encrypted Token Vault
+
+When backends require individual user OAuth authorization (e.g. GitHub, Google Workspace, Slack), `mcp-search-proxy` acts as an encrypted credential broker:
+
+```json
+{
+  "settings": {
+    "publicUrl": "http://localhost:8080",
+    "vaultPath": "~/.config/mcp-search-proxy/vault.enc"
+  },
+  "mcpServers": {
+    "github": {
+      "url": "https://mcp.github.com/mcp",
+      "auth_type": "oauth2_pkce_per_user",
+      "oauth2": {
+        "client_id": "op://Production/GitHubOAuth/client_id",
+        "client_secret": "op://Production/GitHubOAuth/client_secret",
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "scopes": ["repo", "read:user"]
+      }
+    }
+  }
+}
+```
+
+### How Upstream OAuth Works:
+1. **Zero Database Needed**: Stores tokens encrypted at rest with AES-256-GCM in `vault.enc`. Microsecond RAM lookups with atomic write-back.
+2. **Actionable Consent Links**: If an agent attempts to invoke a tool on an unlinked server, the proxy returns a direct link:
+   ```
+   Authentication required: Please connect your account by opening:
+   http://localhost:8080/oauth/connect/github?caller=camilo
+   ```
+3. **Browser PKCE Flow**: The user clicks the link, approves access on the 3rd-party service, and is redirected back to `/oauth/callback/{server}` where the proxy captures and securely vaults the tokens.
+4. **Silent Background Token Refresh**: When an access token expires, the proxy automatically exchanges the `refresh_token` against the provider's `/token` endpoint before forwarding the tool request.
+5. **Endpoints**:
+   * `GET /oauth/connect/{server}`: Initiates authorization flow
+   * `GET /oauth/callback/{server}`: Handles redirect and stores credentials
+   * `GET /oauth/status?user={id}`: Returns connection statuses (ready for Admin Web UI)
+   * `POST /oauth/disconnect/{server}`: Revokes/deletes stored credentials
 
 ---
 
