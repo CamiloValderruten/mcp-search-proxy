@@ -131,6 +131,15 @@ func main() {
 		}
 	}
 
+	var oauthServer *OAuthServer
+	osrv, err := NewOAuthServer(cfg.Settings.PublicURL, "", googleAuthHandler, proxy, logger)
+	if err != nil {
+		logger.Error("failed to initialize oauth2.1 authorization server", "err", err)
+	} else {
+		oauthServer = osrv
+		logger.Info("initialized oauth2.1 authorization server for Gemini Spark and AI clients", "issuer", cfg.Settings.PublicURL)
+	}
+
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
@@ -424,31 +433,50 @@ func main() {
 			_ = json.NewEncoder(w).Encode(m)
 		})
 
-		// 3. Optional Inbound Google OAuth Handler
+		// 3. OAuth 2.1 Server Metadata, Registration, Authorize & Token Endpoints
+		if oauthServer != nil {
+			mux.HandleFunc("/.well-known/oauth-authorization-server", oauthServer.HandleAuthServerMetadata)
+			mux.HandleFunc("/.well-known/oauth-authorization-server/mcp", oauthServer.HandleAuthServerMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource", oauthServer.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", oauthServer.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/oauth/register", oauthServer.HandleRegister)
+			mux.HandleFunc("/oauth/authorize", oauthServer.HandleAuthorize)
+			mux.HandleFunc("/oauth/token", oauthServer.HandleToken)
+		} else if googleAuthHandler != nil {
+			mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
+		}
+
+		// Inbound Google Login Handler
 		if googleAuthHandler != nil {
 			mux.HandleFunc("/auth/login", googleAuthHandler.HandleLogin)
 			mux.HandleFunc("/auth/callback", googleAuthHandler.HandleCallback)
-			mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
-			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
 		}
 
 		// 4. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
 		handleMCP := func(w http.ResponseWriter, r *http.Request) {
 			reqCtx := r.Context()
+			authenticated := false
 
-			// Extract auth token or client identity header
-			authHeader := r.Header.Get("Authorization")
-			token := ""
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				token = strings.TrimPrefix(authHeader, "Bearer ")
-			} else if k := r.Header.Get("X-API-Key"); k != "" {
-				token = k
-			} else if id := r.Header.Get("X-Client-Id"); id != "" {
-				token = id
+			// A. Check OAuth 2.1 Access Token first
+			if oauthServer != nil {
+				if userID, err := oauthServer.ValidateAccessToken(r); err == nil && userID != "" {
+					callerID := userID
+					var identCfg IdentityConfig
+					for id, c := range cfg.Identities {
+						if id == userID || c.MatchesEmail(id, userID) {
+							callerID = id
+							identCfg = c
+							break
+						}
+					}
+					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
+					authenticated = true
+				}
 			}
 
-			// Check Google authentication first if active
-			if googleAuthHandler != nil {
+			// B. Check Google session cookie or bearer token if not yet authenticated
+			if !authenticated && googleAuthHandler != nil {
 				if userEmail, ok := googleAuthHandler.AuthenticateRequest(r); ok {
 					callerID := userEmail
 					var identCfg IdentityConfig
@@ -460,15 +488,46 @@ func main() {
 						}
 					}
 					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
-				} else if token != "" {
-					if id, identCfg, ok := proxy.ResolveIdentity(token); ok && identCfg.Token != "" {
+					authenticated = true
+				}
+			}
+
+			// C. Check Static Token or Header Authentication (X-API-Key, Authorization: Bearer <static>, X-Client-Id)
+			if !authenticated {
+				authHeader := r.Header.Get("Authorization")
+				token := ""
+				if strings.HasPrefix(authHeader, "Bearer ") {
+					token = strings.TrimPrefix(authHeader, "Bearer ")
+				} else if k := r.Header.Get("X-API-Key"); k != "" {
+					token = k
+				} else if id := r.Header.Get("X-Client-Id"); id != "" {
+					token = id
+				}
+
+				if token != "" {
+					if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
 						reqCtx = WithIdentity(reqCtx, id, identCfg)
+						authenticated = true
 					}
 				}
-			} else if token != "" {
-				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
-					reqCtx = WithIdentity(reqCtx, id, identCfg)
-				}
+			}
+
+			// D. If no identities are configured in proxy, allow open access
+			if !authenticated && len(cfg.Identities) == 0 {
+				authenticated = true
+			}
+
+			// E. Enforce authentication
+			if !authenticated {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s", resource_metadata="%s/.well-known/oauth-protected-resource"`, cfg.Settings.PublicURL, cfg.Settings.PublicURL))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":             "unauthorized",
+					"message":           "Authentication required. Connect via OAuth 2.1 or provide a valid Bearer token.",
+					"resource_metadata": fmt.Sprintf("%s/.well-known/oauth-protected-resource", cfg.Settings.PublicURL),
+				})
+				return
 			}
 
 			mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
