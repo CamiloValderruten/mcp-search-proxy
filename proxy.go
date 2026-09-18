@@ -36,6 +36,14 @@ func WithIdentity(ctx context.Context, id string, cfg IdentityConfig) context.Co
 	})
 }
 
+// WithCallerIdentity returns a new context with the caller identity attached.
+func WithCallerIdentity(ctx context.Context, ident *CallerIdentity) context.Context {
+	if ident == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, identityContextKey{}, ident)
+}
+
 // GetCallerIdentity extracts the caller identity from the context, if present.
 func GetCallerIdentity(ctx context.Context) *CallerIdentity {
 	if val, ok := ctx.Value(identityContextKey{}).(*CallerIdentity); ok {
@@ -169,13 +177,22 @@ func (p *Proxy) InitUpstreams(ctx context.Context, cfg *Config) error {
 		} else {
 			p.oauthMgr.UpdateServers(cfg.MCPServers)
 		}
-		p.oauthMgr.OnAuthorized = func(serverName string) {
+		p.oauthMgr.OnAuthorized = func(serverName, caller string) {
 			p.mu.RLock()
 			srv, ok := p.serverConfigs[serverName]
 			p.mu.RUnlock()
 			if ok {
-				p.logger.Info("re-indexing upstream server following oauth authorization", "server", serverName)
-				_, _ = p.initSingleUpstream(context.Background(), serverName, srv)
+				p.logger.Info("re-indexing upstream server following oauth authorization", "server", serverName, "caller", caller)
+				reqCtx := context.Background()
+				if caller != "" {
+					reqCtx = WithCallerIdentity(reqCtx, &CallerIdentity{ID: caller})
+				}
+				_, err := p.initSingleUpstream(reqCtx, serverName, srv)
+				if err == nil {
+					p.mu.Lock()
+					delete(p.serverErrors, serverName)
+					p.mu.Unlock()
+				}
 			}
 		}
 	}
@@ -298,9 +315,22 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 				}
 			}
 			if (srv.AuthType == "oauth2_pkce_per_user" || (p.oauthMgr != nil && p.oauthMgr.IsOAuthRequired(name))) && p.tokenStore != nil {
-				callerID := "default"
+				callerID := ""
 				if ident := GetCallerIdentity(reqCtx); ident != nil && ident.ID != "" {
 					callerID = ident.ID
+				}
+				if callerID == "" {
+					p.mu.RLock()
+					for id := range p.identities {
+						if p.HasValidToken(reqCtx, id, name) {
+							callerID = id
+							break
+						}
+					}
+					p.mu.RUnlock()
+				}
+				if callerID == "" {
+					callerID = "default"
 				}
 				if token, err := p.tokenStore.Get(reqCtx, callerID, name); err == nil && token != nil && token.AccessToken != "" {
 					merged["Authorization"] = "Bearer " + token.AccessToken
@@ -480,8 +510,16 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 		status := "ok"
 		errMsg := ""
 		if errStr, isErr := p.serverErrors[name]; isErr {
-			status = "error"
-			errMsg = errStr
+			callerID := ""
+			if ident != nil && ident.ID != "" {
+				callerID = ident.ID
+			}
+			if callerID != "" && p.HasValidToken(ctx, callerID, name) {
+				status = "ok"
+			} else {
+				status = "error"
+				errMsg = errStr
+			}
 		}
 		servers = append(servers, ServerInfo{
 			Name:        name,
@@ -573,7 +611,7 @@ func (p *Proxy) searchSemantic(ctx context.Context, query string, limit int) (st
 			continue
 		}
 		sim := CosineSimilarity(qVec, vec)
-		if sim > 0.25 { // Relevance threshold
+		if sim > 0.45 { // Relevance threshold raised from 0.25 to eliminate noise
 			matches = append(matches, matchItem{similarity: sim, reg: reg})
 		}
 	}
@@ -587,6 +625,18 @@ func (p *Proxy) searchSemantic(ctx context.Context, query string, limit int) (st
 	sort.Slice(matches, func(i, j int) bool {
 		return matches[i].similarity > matches[j].similarity
 	})
+
+	// Relative drop-off (elbow cutoff):
+	// Keep only results within 0.12 similarity of the top result
+	topSim := matches[0].similarity
+	cutoff := topSim - 0.12
+	filtered := matches[:0]
+	for _, m := range matches {
+		if m.similarity >= cutoff {
+			filtered = append(filtered, m)
+		}
+	}
+	matches = filtered
 
 	if limit <= 0 || limit > len(matches) {
 		limit = len(matches)
@@ -709,11 +759,27 @@ func (p *Proxy) searchLexical(ctx context.Context, query string, limit int) stri
 		return matches[i].reg.Tool.Name < matches[j].reg.Tool.Name
 	})
 
+	if query != "*" && len(matches) > 0 {
+		topScore := matches[0].score
+		if topScore >= 8 {
+			cutoff := topScore / 3
+			filtered := matches[:0]
+			for _, m := range matches {
+				if m.score >= cutoff {
+					filtered = append(filtered, m)
+				}
+			}
+			matches = filtered
+		}
+	}
+
 	if limit <= 0 || limit > len(matches) {
 		limit = len(matches)
 	}
 	if limit > 8 && query != "*" {
 		limit = 8
+	} else if limit > 15 {
+		limit = 15
 	}
 
 	var sb strings.Builder
@@ -848,9 +914,22 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 	// 4. Upstream OAuth2 Per-User Consent & Token Verification
 	isOAuth := reg.ServerConfig.AuthType == "oauth2_pkce_per_user" || (p.oauthMgr != nil && p.oauthMgr.IsOAuthRequired(reg.ServerName))
 	if isOAuth {
-		callerID := "default"
+		callerID := ""
 		if ident != nil && ident.ID != "" {
 			callerID = ident.ID
+		}
+		if callerID == "" {
+			p.mu.RLock()
+			for id := range p.identities {
+				if p.HasValidToken(ctx, id, reg.ServerName) {
+					callerID = id
+					break
+				}
+			}
+			p.mu.RUnlock()
+		}
+		if callerID == "" {
+			callerID = "default"
 		}
 		if p.tokenStore != nil {
 			token, err := p.tokenStore.Get(ctx, callerID, reg.ServerName)
@@ -1095,5 +1174,41 @@ func (p *Proxy) OAuthManager() *OAuthManager {
 // SetOAuthManager allows overriding the OAuthManager (useful for testing).
 func (p *Proxy) SetOAuthManager(m *OAuthManager) {
 	p.oauthMgr = m
+}
+
+// HasValidToken checks if the given caller has a valid, non-expired token for the server.
+func (p *Proxy) HasValidToken(ctx context.Context, caller, serverName string) bool {
+	if p.tokenStore == nil || caller == "" {
+		return false
+	}
+	tok, err := p.tokenStore.Get(ctx, caller, serverName)
+	if err != nil || tok == nil || tok.AccessToken == "" {
+		return false
+	}
+	return !tok.IsExpired(time.Minute)
+}
+
+// EnsureServerIndexed triggers an initialization/indexing of an upstream server for the given caller if it is not currently indexed.
+func (p *Proxy) EnsureServerIndexed(ctx context.Context, serverName, caller string) error {
+	p.mu.RLock()
+	_, indexed := p.clients[serverName]
+	srv, exists := p.serverConfigs[serverName]
+	p.mu.RUnlock()
+
+	if !exists || indexed {
+		return nil
+	}
+
+	reqCtx := context.Background()
+	if caller != "" {
+		reqCtx = WithCallerIdentity(reqCtx, &CallerIdentity{ID: caller})
+	}
+	_, err := p.initSingleUpstream(reqCtx, serverName, srv)
+	if err == nil {
+		p.mu.Lock()
+		delete(p.serverErrors, serverName)
+		p.mu.Unlock()
+	}
+	return err
 }
 

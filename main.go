@@ -152,17 +152,9 @@ func main() {
 		mcp.WithDescription("List all connected upstream MCP servers, descriptions, tool counts, and security policies accessible to your identity."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		ident := GetCallerIdentity(ctx)
-		if ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
 		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
@@ -184,12 +176,19 @@ func main() {
 				roFlag = " `[read-only]`"
 			}
 			if srv.Status == "error" {
-				errLower := strings.ToLower(srv.Error)
-				if strings.Contains(errLower, "authorization") || strings.Contains(errLower, "unauthorized") {
-					connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, srv.Name, callerID)
-					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[requires authorization]`): %s\n  ⚠️ Action Required: Do NOT attempt alternative shell commands or look for credentials on disk.\n  Immediately tell the user to connect their account:\n  👉 %s\n", srv.Name, desc, connectURL))
+				if callerID != "" && proxy.HasValidToken(ctx, callerID, srv.Name) {
+					go func(s string, c string) {
+						_ = proxy.EnsureServerIndexed(context.Background(), s, c)
+					}(srv.Name, callerID)
+					sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
 				} else {
-					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+					errLower := strings.ToLower(srv.Error)
+					if strings.Contains(errLower, "authorization") || strings.Contains(errLower, "unauthorized") {
+						connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, srv.Name, callerID)
+						sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[requires authorization]`): %s\n  ⚠️ Action Required: Do NOT attempt alternative shell commands or look for credentials on disk.\n  Immediately tell the user to connect their account:\n  👉 %s\n", srv.Name, desc, connectURL))
+					} else {
+						sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+					}
 				}
 			} else {
 				sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
@@ -205,17 +204,9 @@ func main() {
 		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		ident := GetCallerIdentity(ctx)
-		if ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
 		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
@@ -234,6 +225,12 @@ func main() {
 		var unauthServers []string
 		for sName, sErr := range proxy.serverErrors {
 			if !proxy.isServerAccessible(ident, sName) {
+				continue
+			}
+			if callerID != "" && proxy.HasValidToken(ctx, callerID, sName) {
+				go func(s string, c string) {
+					_ = proxy.EnsureServerIndexed(context.Background(), s, c)
+				}(sName, callerID)
 				continue
 			}
 			sErrLower := strings.ToLower(sErr)
@@ -264,17 +261,9 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		ident := GetCallerIdentity(ctx)
-		if ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
 		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
@@ -303,6 +292,12 @@ func main() {
 				var unauthServers []string
 				for sName, sErr := range proxy.serverErrors {
 					if !proxy.isServerAccessible(ident, sName) {
+						continue
+					}
+					if callerID != "" && proxy.HasValidToken(ctx, callerID, sName) {
+						go func(s string, c string) {
+							_ = proxy.EnsureServerIndexed(context.Background(), s, c)
+						}(sName, callerID)
 						continue
 					}
 					sErrLower := strings.ToLower(sErr)
@@ -334,17 +329,9 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
 	)
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		ident := GetCallerIdentity(ctx)
-		if ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
 		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
@@ -539,6 +526,7 @@ func main() {
 		// 5. OAuth2 Endpoints for Upstream Per-User Delegation
 		if proxy.OAuthManager() != nil {
 			mux.HandleFunc("/oauth/connect/", proxy.OAuthManager().HandleConnect)
+			mux.HandleFunc("/oauth/callback", proxy.OAuthManager().HandleCallback)
 			mux.HandleFunc("/oauth/callback/", proxy.OAuthManager().HandleCallback)
 			mux.HandleFunc("/oauth/status", proxy.OAuthManager().HandleStatus)
 			mux.HandleFunc("/oauth/disconnect/", proxy.OAuthManager().HandleDisconnect)
@@ -648,3 +636,27 @@ func main() {
 		}(lineCopy)
 	}
 }
+
+func resolveCaller(ctx context.Context, cfg *Config) (context.Context, *CallerIdentity, string) {
+	callerID := ""
+	ident := GetCallerIdentity(ctx)
+	if ident != nil {
+		callerID = ident.ID
+	}
+	if callerID == "" {
+		for id := range cfg.Identities {
+			callerID = id
+			break
+		}
+	}
+	if ident == nil && callerID != "" {
+		if idCfg, ok := cfg.Identities[callerID]; ok {
+			ident = &CallerIdentity{ID: callerID, Config: idCfg}
+		} else {
+			ident = &CallerIdentity{ID: callerID}
+		}
+		ctx = WithCallerIdentity(ctx, ident)
+	}
+	return ctx, ident, callerID
+}
+

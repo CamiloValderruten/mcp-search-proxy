@@ -21,6 +21,7 @@ type oauthState struct {
 	Caller       string
 	Server       string
 	CodeVerifier string
+	RedirectURI  string
 	CreatedAt    time.Time
 }
 
@@ -49,7 +50,7 @@ type OAuthManager struct {
 	discoveredMu sync.RWMutex
 	discovered   map[string]*DiscoveredOAuth
 
-	OnAuthorized func(serverName string)
+	OnAuthorized func(serverName, caller string)
 }
 
 // DiscoveredOAuth holds dynamically discovered OAuth2 endpoints from an upstream MCP server.
@@ -338,23 +339,25 @@ func (m *OAuthManager) GetConnectURL(serverName, caller string) string {
 	return fmt.Sprintf("%s/oauth/connect/%s?caller=%s", m.publicURL, url.PathEscape(serverName), url.QueryEscape(caller))
 }
 
-// HandleConnect starts the authorization code flow with PKCE for an upstream server.
+// HandleConnect initiates the upstream OAuth PKCE flow by redirecting the user's browser to the AS.
 func (m *OAuthManager) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	serverName := strings.TrimPrefix(r.URL.Path, "/oauth/connect/")
 	serverName = strings.Trim(serverName, "/")
 	if serverName == "" {
-		serverName = r.URL.Query().Get("server")
+		http.Error(w, "Missing server name in URL path (e.g. /oauth/connect/{server})", http.StatusBadRequest)
+		return
 	}
 
 	caller := r.URL.Query().Get("caller")
 	if caller == "" {
-		caller = "default"
+		http.Error(w, "Missing 'caller' query parameter (e.g. ?caller=camilo)", http.StatusBadRequest)
+		return
 	}
 
 	ctx := r.Context()
 	oauthCfg, err := m.getEffectiveOAuthConfig(ctx, serverName)
 	if err != nil || oauthCfg.AuthURL == "" {
-		http.Error(w, fmt.Sprintf("Server %q OAuth resolution failed: %v", serverName, err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("OAuth configuration for server %q not found or missing auth_url: %v", serverName, err), http.StatusBadRequest)
 		return
 	}
 
@@ -369,24 +372,18 @@ func (m *OAuthManager) HandleConnect(w http.ResponseWriter, r *http.Request) {
 	verifier := generateRandomString(43)
 	challenge := pkceChallenge(verifier)
 
+	callbackURL := fmt.Sprintf("%s/oauth/callback", m.publicURL)
+
 	m.statesMu.Lock()
-	// Prune expired states (> 15 minutes)
-	cutoff := time.Now().Add(-15 * time.Minute)
-	for k, st := range m.states {
-		if st.CreatedAt.Before(cutoff) {
-			delete(m.states, k)
-		}
-	}
 	m.states[stateNonce] = oauthState{
 		State:        stateNonce,
 		Caller:       caller,
 		Server:       serverName,
 		CodeVerifier: verifier,
+		RedirectURI:  callbackURL,
 		CreatedAt:    time.Now(),
 	}
 	m.statesMu.Unlock()
-
-	callbackURL := fmt.Sprintf("%s/oauth/callback/%s", m.publicURL, url.PathEscape(serverName))
 
 	authURL, err := url.Parse(oauthCfg.AuthURL)
 	if err != nil {
@@ -444,10 +441,15 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	m.statesMu.Unlock()
 
-	if !exists || st.Server != serverName {
+	if !exists {
 		http.Error(w, "Invalid or expired OAuth state parameter (CSRF protection)", http.StatusForbidden)
 		return
 	}
+	if serverName != "" && st.Server != serverName {
+		http.Error(w, "State parameter does not match requested server", http.StatusForbidden)
+		return
+	}
+	serverName = st.Server
 
 	ctx := r.Context()
 	oauthCfg, err := m.getEffectiveOAuthConfig(ctx, serverName)
@@ -469,7 +471,10 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	callbackURL := fmt.Sprintf("%s/oauth/callback/%s", m.publicURL, url.PathEscape(serverName))
+	callbackURL := st.RedirectURI
+	if callbackURL == "" {
+		callbackURL = fmt.Sprintf("%s/oauth/callback", m.publicURL)
+	}
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -550,7 +555,7 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	m.logger.Info("successfully stored oauth tokens for user and server", "user", st.Caller, "server", st.Server)
 	if m.OnAuthorized != nil {
-		go m.OnAuthorized(st.Server)
+		go m.OnAuthorized(st.Server, st.Caller)
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
