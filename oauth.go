@@ -674,6 +674,9 @@ func (m *OAuthManager) RefreshToken(ctx context.Context, user, serverName string
 func (m *OAuthManager) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	caller := r.URL.Query().Get("user")
 	if caller == "" {
+		caller = r.URL.Query().Get("caller")
+	}
+	if caller == "" {
 		caller = "default"
 	}
 

@@ -333,6 +333,11 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 					callerID = "default"
 				}
 				if token, err := p.tokenStore.Get(reqCtx, callerID, name); err == nil && token != nil && token.AccessToken != "" {
+					if token.IsExpired(2*time.Minute) && token.RefreshToken != "" && p.oauthMgr != nil {
+						if refreshed, refErr := p.oauthMgr.RefreshToken(reqCtx, callerID, name); refErr == nil && refreshed != nil {
+							token = refreshed
+						}
+					}
 					merged["Authorization"] = "Bearer " + token.AccessToken
 				}
 			}
@@ -1185,7 +1190,15 @@ func (p *Proxy) HasValidToken(ctx context.Context, caller, serverName string) bo
 	if err != nil || tok == nil || tok.AccessToken == "" {
 		return false
 	}
-	return !tok.IsExpired(time.Minute)
+	if !tok.IsExpired(time.Minute) {
+		return true
+	}
+	if tok.RefreshToken != "" && p.oauthMgr != nil {
+		if refreshed, err := p.oauthMgr.RefreshToken(ctx, caller, serverName); err == nil && refreshed != nil && !refreshed.IsExpired(time.Minute) {
+			return true
+		}
+	}
+	return false
 }
 
 // EnsureServerIndexed triggers an initialization/indexing of an upstream server for the given caller if it is not currently indexed.
