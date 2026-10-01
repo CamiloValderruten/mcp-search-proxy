@@ -237,15 +237,13 @@ func (p *Proxy) computeToolEmbeddings(ctx context.Context) {
 	var toolTexts []string
 
 	for key, reg := range p.tools {
-		if strings.Contains(key, ":") {
-			continue
-		}
+
 		serverDesc := p.serverDescs[reg.ServerName]
 		text := fmt.Sprintf("%s: %s - %s", reg.ServerName, reg.Tool.Name, reg.Tool.Description)
 		if serverDesc != "" {
 			text += fmt.Sprintf(" (%s)", serverDesc)
 		}
-		toolNames = append(toolNames, reg.Tool.Name)
+		toolNames = append(toolNames, key)
 		toolTexts = append(toolTexts, text)
 	}
 	p.mu.RUnlock()
@@ -427,7 +425,6 @@ func (p *Proxy) initSingleUpstream(ctx context.Context, name string, srv ServerC
 			Client:       c,
 			ServerConfig: srv,
 		}
-		p.tools[tool.Name] = reg
 		p.tools[name+":"+tool.Name] = reg
 		p.logger.Debug("indexed tool", "server", name, "tool", tool.Name)
 	}
@@ -486,11 +483,9 @@ func (p *Proxy) ListServers(ctx context.Context) []ServerInfo {
 	ident := GetCallerIdentity(ctx)
 
 	counts := make(map[string]int)
-	for key, reg := range p.tools {
-		if strings.Contains(key, ":") {
-			if p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
-				counts[reg.ServerName]++
-			}
+	for _, reg := range p.tools {
+		if p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
+			counts[reg.ServerName]++
 		}
 	}
 
@@ -548,12 +543,7 @@ func (p *Proxy) GetMetrics() Metrics {
 	p.mu.RLock()
 	activeUpstreams := len(p.clients)
 	failedUpstreams := len(p.serverErrors)
-	toolCount := 0
-	for k := range p.tools {
-		if !strings.Contains(k, ":") {
-			toolCount++
-		}
-	}
+	toolCount := len(p.tools)
 	p.mu.RUnlock()
 
 	p.embedMu.RLock()
@@ -662,9 +652,10 @@ func (p *Proxy) searchSemantic(ctx context.Context, query string, limit int) (st
 			desc = desc[:97] + "..."
 		}
 
-		sb.WriteString(fmt.Sprintf("- **`%s`** (%s) `[sim: %.2f]`\n", t.Name, server, matches[i].similarity))
+		qualifiedName := server + ":" + t.Name
+		sb.WriteString(fmt.Sprintf("- **`%s`** `[sim: %.2f]`\n", qualifiedName, matches[i].similarity))
 		if params != "" {
-			sb.WriteString(fmt.Sprintf("  `%s(%s)`\n", t.Name, params))
+			sb.WriteString(fmt.Sprintf("  `%s(%s)`\n", qualifiedName, params))
 		}
 		if desc != "" {
 			sb.WriteString(fmt.Sprintf("  %s\n", desc))
@@ -701,10 +692,8 @@ func (p *Proxy) searchLexical(ctx context.Context, query string, limit int) stri
 	var matches []matchItem
 	seen := make(map[string]bool)
 
-	for key, reg := range p.tools {
-		if strings.Contains(key, ":") {
-			continue
-		}
+	for _, reg := range p.tools {
+
 
 		if !p.isToolAccessible(ident, reg.ServerName, reg.Tool.Name) {
 			continue
@@ -800,9 +789,10 @@ func (p *Proxy) searchLexical(ctx context.Context, query string, limit int) stri
 			desc = desc[:97] + "..."
 		}
 
-		sb.WriteString(fmt.Sprintf("- **`%s`** (%s)\n", t.Name, server))
+		qualifiedName := server + ":" + t.Name
+		sb.WriteString(fmt.Sprintf("- **`%s`**\n", qualifiedName))
 		if params != "" {
-			sb.WriteString(fmt.Sprintf("  `%s(%s)`\n", t.Name, params))
+			sb.WriteString(fmt.Sprintf("  `%s(%s)`\n", qualifiedName, params))
 		}
 		if desc != "" {
 			sb.WriteString(fmt.Sprintf("  %s\n", desc))
@@ -851,27 +841,14 @@ func (p *Proxy) CallTool(ctx context.Context, toolName string, args map[string]a
 
 	p.mu.RLock()
 	reg, ok := p.tools[toolName]
-	if !ok || (ident != nil && !p.isServerAccessible(ident, reg.ServerName)) {
-		found := false
-		for k, r := range p.tools {
-			if strings.Contains(k, ":") && r.Tool.Name == toolName {
-				if ident == nil || p.isServerAccessible(ident, r.ServerName) {
-					reg = r
-					found = true
-					ok = true
-					break
-				}
-			}
+	if !ok {
+		p.mu.RUnlock()
+		p.errors.Add(1)
+		suggestions := p.findSuggestions(toolName)
+		if len(suggestions) > 0 {
+			return nil, fmt.Errorf("tool %q not found. Did you mean: %s?", toolName, strings.Join(suggestions, ", "))
 		}
-		if !found && !ok {
-			p.mu.RUnlock()
-			p.errors.Add(1)
-			suggestions := p.findSuggestions(toolName)
-			if len(suggestions) > 0 {
-				return nil, fmt.Errorf("tool %q not found. Did you mean: %s?", toolName, strings.Join(suggestions, ", "))
-			}
-			return nil, fmt.Errorf("tool %q not found across connected upstream servers", toolName)
-		}
+		return nil, fmt.Errorf("tool %q not found across connected upstream servers", toolName)
 	}
 	p.mu.RUnlock()
 
@@ -1135,14 +1112,11 @@ func (p *Proxy) findSuggestions(name string) []string {
 	var matches []string
 	seen := make(map[string]bool)
 
-	for t, reg := range p.tools {
-		if strings.Contains(t, ":") {
-			continue
-		}
-		tLower := strings.ToLower(reg.Tool.Name)
-		if (strings.Contains(tLower, nameLower) || strings.Contains(nameLower, tLower)) && !seen[reg.Tool.Name] {
-			seen[reg.Tool.Name] = true
-			matches = append(matches, reg.Tool.Name)
+	for t := range p.tools {
+		tLower := strings.ToLower(t)
+		if (strings.Contains(tLower, nameLower) || strings.Contains(nameLower, tLower)) && !seen[t] {
+			seen[t] = true
+			matches = append(matches, t)
 			if len(matches) >= 3 {
 				break
 			}
