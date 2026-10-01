@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -339,3 +342,100 @@ func TestProxyInitUpstreams(t *testing.T) {
 	// but it gets coverage.
 	_ = p.InitUpstreams(context.Background(), cfg)
 }
+
+func TestSemanticSearchRelevanceAndElbowCutoff(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req openAIEmbeddingRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := openAIEmbeddingResponse{
+			Data: []openAIEmbeddingData{
+				{Embedding: []float32{1.0, 0.0, 0.0}},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer mockServer.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	p := NewProxy(logger, 5*time.Second)
+	p.embedder = NewEmbedder("test-key", "test-model", mockServer.URL)
+
+	// Tool 1: High similarity (1.0)
+	p.tools["tool_exact"] = &RegisteredTool{
+		ServerName: "server1",
+		Tool:       mcp.Tool{Name: "tool_exact", Description: "Exact tool"},
+	}
+	p.toolVectors["tool_exact"] = []float32{1.0, 0.0, 0.0}
+
+	// Tool 2: High similarity (0.95, diff 0.05 < 0.12)
+	p.tools["tool_close"] = &RegisteredTool{
+		ServerName: "server1",
+		Tool:       mcp.Tool{Name: "tool_close", Description: "Close tool"},
+	}
+	p.toolVectors["tool_close"] = []float32{0.95, 0.312, 0.0}
+
+	// Tool 3: Below elbow cutoff (sim ~ 0.70, diff 0.30 > 0.12)
+	p.tools["tool_distant"] = &RegisteredTool{
+		ServerName: "server1",
+		Tool:       mcp.Tool{Name: "tool_distant", Description: "Distant tool"},
+	}
+	p.toolVectors["tool_distant"] = []float32{0.70, 0.714, 0.0}
+
+	// Tool 4: Below absolute floor (sim ~ 0.30 < 0.45)
+	p.tools["tool_unrelated"] = &RegisteredTool{
+		ServerName: "server1",
+		Tool:       mcp.Tool{Name: "tool_unrelated", Description: "Unrelated tool"},
+	}
+	p.toolVectors["tool_unrelated"] = []float32{0.30, 0.95, 0.0}
+
+	res := p.SearchToolsFormatConcise(context.Background(), "query", 8)
+	if !contains(res, "tool_exact") {
+		t.Fatalf("expected tool_exact to be in results, got: %s", res)
+	}
+	if !contains(res, "tool_close") {
+		t.Fatalf("expected tool_close to be in results, got: %s", res)
+	}
+	if contains(res, "tool_distant") {
+		t.Fatalf("expected tool_distant to be dropped by elbow cutoff, got: %s", res)
+	}
+	if contains(res, "tool_unrelated") {
+		t.Fatalf("expected tool_unrelated to be dropped below 0.45 threshold, got: %s", res)
+	}
+}
+
+func TestHasValidTokenAndEnsureServerIndexed(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	p := NewProxy(logger, 5*time.Second)
+
+	vaultStore, err := NewEncryptedFileTokenStore(filepath.Join(t.TempDir(), "vault.enc"), "test-key-1234")
+	if err != nil {
+		t.Fatalf("failed to create vault: %v", err)
+	}
+	p.SetTokenStore(vaultStore)
+
+	ctx := context.Background()
+	if p.HasValidToken(ctx, "camilo", "nerdoracle") {
+		t.Fatalf("expected no valid token initially")
+	}
+
+	_ = vaultStore.Put(ctx, "camilo", "nerdoracle", &TokenSet{
+		AccessToken: "test-token",
+		ExpiresAt:   time.Now().Add(1 * time.Hour),
+	})
+
+	if !p.HasValidToken(ctx, "camilo", "nerdoracle") {
+		t.Fatalf("expected valid token for camilo")
+	}
+
+	// Server marked with error initially
+	p.serverConfigs["nerdoracle"] = ServerConfig{Command: "false"}
+	p.serverErrors["nerdoracle"] = "401 unauthorized"
+	servers := p.ListServers(WithCallerIdentity(ctx, &CallerIdentity{ID: "camilo"}))
+	// Because camilo has valid token, ListServers should not mark nerdoracle as error
+	for _, s := range servers {
+		if s.Name == "nerdoracle" && s.Status == "error" {
+			t.Fatalf("expected nerdoracle status to be ok for authenticated caller, got error")
+		}
+	}
+}
+

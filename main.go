@@ -131,6 +131,15 @@ func main() {
 		}
 	}
 
+	var oauthServer *OAuthServer
+	osrv, err := NewOAuthServer(cfg.Settings.PublicURL, "", googleAuthHandler, proxy, logger)
+	if err != nil {
+		logger.Error("failed to initialize oauth2.1 authorization server", "err", err)
+	} else {
+		oauthServer = osrv
+		logger.Info("initialized oauth2.1 authorization server for Gemini Spark and AI clients", "issuer", cfg.Settings.PublicURL)
+	}
+
 	s := server.NewMCPServer(
 		"mcp-search-proxy",
 		version,
@@ -143,18 +152,11 @@ func main() {
 		mcp.WithDescription("List all connected upstream MCP servers, descriptions, tool counts, and security policies accessible to your identity."),
 	)
 	s.AddTool(listServersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		if ident := GetCallerIdentity(ctx); ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
-		if googleAuthHandler != nil {
+		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
 			if !isAuth {
 				return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
@@ -174,12 +176,19 @@ func main() {
 				roFlag = " `[read-only]`"
 			}
 			if srv.Status == "error" {
-				errLower := strings.ToLower(srv.Error)
-				if strings.Contains(errLower, "authorization") || strings.Contains(errLower, "unauthorized") {
-					connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, srv.Name, callerID)
-					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[requires authorization]`): %s\n  ⚠️ Action Required: Do NOT attempt alternative shell commands or look for credentials on disk.\n  Immediately tell the user to connect their account:\n  👉 %s\n", srv.Name, desc, connectURL))
+				if callerID != "" && proxy.HasValidToken(ctx, callerID, srv.Name) {
+					go func(s string, c string) {
+						_ = proxy.EnsureServerIndexed(context.Background(), s, c)
+					}(srv.Name, callerID)
+					sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
 				} else {
-					sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+					errLower := strings.ToLower(srv.Error)
+					if strings.Contains(errLower, "authorization") || strings.Contains(errLower, "unauthorized") {
+						connectURL := fmt.Sprintf("%s/oauth/connect/%s?caller=%s", cfg.Settings.PublicURL, srv.Name, callerID)
+						sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[requires authorization]`): %s\n  ⚠️ Action Required: Do NOT attempt alternative shell commands or look for credentials on disk.\n  Immediately tell the user to connect their account:\n  👉 %s\n", srv.Name, desc, connectURL))
+					} else {
+						sb.WriteString(fmt.Sprintf("- **`%s`** (0 tools `[error: %s]`): %s\n", srv.Name, srv.Error, desc))
+					}
 				}
 			} else {
 				sb.WriteString(fmt.Sprintf("- **`%s`** (%d tools)%s: %s\n", srv.Name, srv.ToolCount, roFlag, desc))
@@ -195,18 +204,11 @@ func main() {
 		mcp.WithString("query", mcp.Required(), mcp.Description("Keywords describing what you need (e.g. 'search', 'email', 'database', or '*' for all).")),
 	)
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		if ident := GetCallerIdentity(ctx); ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
-		if googleAuthHandler != nil {
+		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
 			if !isAuth {
 				return mcp.NewToolResultText(fmt.Sprintf("⚠️ Authentication Required: You are not signed in to the MCP Gateway.\nDo NOT attempt alternative shell commands or look for credentials on disk.\nImmediately tell the user to sign in with Google:\n👉 %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
@@ -222,6 +224,15 @@ func main() {
 		proxy.mu.RLock()
 		var unauthServers []string
 		for sName, sErr := range proxy.serverErrors {
+			if !proxy.isServerAccessible(ident, sName) {
+				continue
+			}
+			if callerID != "" && proxy.HasValidToken(ctx, callerID, sName) {
+				go func(s string, c string) {
+					_ = proxy.EnsureServerIndexed(context.Background(), s, c)
+				}(sName, callerID)
+				continue
+			}
 			sErrLower := strings.ToLower(sErr)
 			if strings.Contains(sErrLower, "authorization") || strings.Contains(sErrLower, "unauthorized") {
 				unauthServers = append(unauthServers, sName)
@@ -250,18 +261,11 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Name of the tool to invoke (e.g. 'query_db' or 'postgres:query_db').")),
 	)
 	s.AddTool(callTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		if ident := GetCallerIdentity(ctx); ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
-		if googleAuthHandler != nil {
+		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
 			if !isAuth {
 				return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
@@ -287,6 +291,15 @@ func main() {
 				proxy.mu.RLock()
 				var unauthServers []string
 				for sName, sErr := range proxy.serverErrors {
+					if !proxy.isServerAccessible(ident, sName) {
+						continue
+					}
+					if callerID != "" && proxy.HasValidToken(ctx, callerID, sName) {
+						go func(s string, c string) {
+							_ = proxy.EnsureServerIndexed(context.Background(), s, c)
+						}(sName, callerID)
+						continue
+					}
 					sErrLower := strings.ToLower(sErr)
 					if strings.Contains(sErrLower, "authorization") || strings.Contains(sErrLower, "unauthorized") {
 						unauthServers = append(unauthServers, sName)
@@ -316,18 +329,11 @@ func main() {
 		mcp.WithString("tool_name", mcp.Required(), mcp.Description("Exact name of the tool to inspect.")),
 	)
 	s.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		callerID := ""
-		if ident := GetCallerIdentity(ctx); ident != nil {
-			callerID = ident.ID
-		}
-		if callerID == "" {
-			for id := range cfg.Identities {
-				callerID = id
-				break
-			}
-		}
+		var ident *CallerIdentity
+		var callerID string
+		ctx, ident, callerID = resolveCaller(ctx, cfg)
 
-		if googleAuthHandler != nil {
+		if googleAuthHandler != nil && (ident == nil || ident.Config.Token == "") {
 			isAuth, _ := googleAuthHandler.IsCallerAuthenticated(ctx, callerID)
 			if !isAuth {
 				return mcp.NewToolResultError(fmt.Sprintf("authentication required: you are not signed in to the MCP Gateway. Do NOT attempt shell commands or look for credentials on disk. Immediately tell the user to sign in with Google by visiting: %s/auth/login?caller=%s", cfg.Settings.PublicURL, callerID)), nil
@@ -414,31 +420,50 @@ func main() {
 			_ = json.NewEncoder(w).Encode(m)
 		})
 
-		// 3. Optional Inbound Google OAuth Handler
+		// 3. OAuth 2.1 Server Metadata, Registration, Authorize & Token Endpoints
+		if oauthServer != nil {
+			mux.HandleFunc("/.well-known/oauth-authorization-server", oauthServer.HandleAuthServerMetadata)
+			mux.HandleFunc("/.well-known/oauth-authorization-server/mcp", oauthServer.HandleAuthServerMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource", oauthServer.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", oauthServer.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/oauth/register", oauthServer.HandleRegister)
+			mux.HandleFunc("/oauth/authorize", oauthServer.HandleAuthorize)
+			mux.HandleFunc("/oauth/token", oauthServer.HandleToken)
+		} else if googleAuthHandler != nil {
+			mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
+			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
+		}
+
+		// Inbound Google Login Handler
 		if googleAuthHandler != nil {
 			mux.HandleFunc("/auth/login", googleAuthHandler.HandleLogin)
 			mux.HandleFunc("/auth/callback", googleAuthHandler.HandleCallback)
-			mux.HandleFunc("/.well-known/oauth-protected-resource", googleAuthHandler.HandleProtectedResourceMetadata)
-			mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", googleAuthHandler.HandleProtectedResourceMetadata)
 		}
 
 		// 4. MCP Streamable HTTP / SSE Endpoint with Identity Authentication
 		handleMCP := func(w http.ResponseWriter, r *http.Request) {
 			reqCtx := r.Context()
+			authenticated := false
 
-			// Extract auth token or client identity header
-			authHeader := r.Header.Get("Authorization")
-			token := ""
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				token = strings.TrimPrefix(authHeader, "Bearer ")
-			} else if k := r.Header.Get("X-API-Key"); k != "" {
-				token = k
-			} else if id := r.Header.Get("X-Client-Id"); id != "" {
-				token = id
+			// A. Check OAuth 2.1 Access Token first
+			if oauthServer != nil {
+				if userID, err := oauthServer.ValidateAccessToken(r); err == nil && userID != "" {
+					callerID := userID
+					var identCfg IdentityConfig
+					for id, c := range cfg.Identities {
+						if id == userID || c.MatchesEmail(id, userID) {
+							callerID = id
+							identCfg = c
+							break
+						}
+					}
+					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
+					authenticated = true
+				}
 			}
 
-			// Check Google authentication first if active
-			if googleAuthHandler != nil {
+			// B. Check Google session cookie or bearer token if not yet authenticated
+			if !authenticated && googleAuthHandler != nil {
 				if userEmail, ok := googleAuthHandler.AuthenticateRequest(r); ok {
 					callerID := userEmail
 					var identCfg IdentityConfig
@@ -450,15 +475,46 @@ func main() {
 						}
 					}
 					reqCtx = WithIdentity(reqCtx, callerID, identCfg)
-				} else if token != "" {
-					if id, identCfg, ok := proxy.ResolveIdentity(token); ok && identCfg.Token != "" {
+					authenticated = true
+				}
+			}
+
+			// C. Check Static Token or Header Authentication (X-API-Key, Authorization: Bearer <static>, X-Client-Id)
+			if !authenticated {
+				authHeader := r.Header.Get("Authorization")
+				token := ""
+				if strings.HasPrefix(authHeader, "Bearer ") {
+					token = strings.TrimPrefix(authHeader, "Bearer ")
+				} else if k := r.Header.Get("X-API-Key"); k != "" {
+					token = k
+				} else if id := r.Header.Get("X-Client-Id"); id != "" {
+					token = id
+				}
+
+				if token != "" {
+					if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
 						reqCtx = WithIdentity(reqCtx, id, identCfg)
+						authenticated = true
 					}
 				}
-			} else if token != "" {
-				if id, identCfg, ok := proxy.ResolveIdentity(token); ok {
-					reqCtx = WithIdentity(reqCtx, id, identCfg)
-				}
+			}
+
+			// D. If no identities are configured in proxy, allow open access
+			if !authenticated && len(cfg.Identities) == 0 {
+				authenticated = true
+			}
+
+			// E. Enforce authentication
+			if !authenticated {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s", resource_metadata="%s/.well-known/oauth-protected-resource"`, cfg.Settings.PublicURL, cfg.Settings.PublicURL))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":             "unauthorized",
+					"message":           "Authentication required. Connect via OAuth 2.1 or provide a valid Bearer token.",
+					"resource_metadata": fmt.Sprintf("%s/.well-known/oauth-protected-resource", cfg.Settings.PublicURL),
+				})
+				return
 			}
 
 			mcpHTTPHandler.ServeHTTP(w, r.WithContext(reqCtx))
@@ -470,6 +526,7 @@ func main() {
 		// 5. OAuth2 Endpoints for Upstream Per-User Delegation
 		if proxy.OAuthManager() != nil {
 			mux.HandleFunc("/oauth/connect/", proxy.OAuthManager().HandleConnect)
+			mux.HandleFunc("/oauth/callback", proxy.OAuthManager().HandleCallback)
 			mux.HandleFunc("/oauth/callback/", proxy.OAuthManager().HandleCallback)
 			mux.HandleFunc("/oauth/status", proxy.OAuthManager().HandleStatus)
 			mux.HandleFunc("/oauth/disconnect/", proxy.OAuthManager().HandleDisconnect)
@@ -579,3 +636,27 @@ func main() {
 		}(lineCopy)
 	}
 }
+
+func resolveCaller(ctx context.Context, cfg *Config) (context.Context, *CallerIdentity, string) {
+	callerID := ""
+	ident := GetCallerIdentity(ctx)
+	if ident != nil {
+		callerID = ident.ID
+	}
+	if callerID == "" {
+		for id := range cfg.Identities {
+			callerID = id
+			break
+		}
+	}
+	if ident == nil && callerID != "" {
+		if idCfg, ok := cfg.Identities[callerID]; ok {
+			ident = &CallerIdentity{ID: callerID, Config: idCfg}
+		} else {
+			ident = &CallerIdentity{ID: callerID}
+		}
+		ctx = WithCallerIdentity(ctx, ident)
+	}
+	return ctx, ident, callerID
+}
+

@@ -39,6 +39,7 @@ type googleUserInfo struct {
 type googleAuthState struct {
 	CreatedAt time.Time
 	Caller    string
+	ReturnTo  string
 }
 
 // GoogleAuthHandler handles Inbound "Sign in with Google" to authenticate AI clients and users to the proxy.
@@ -142,6 +143,7 @@ func min(a, b int) int {
 func (h *GoogleAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	state := generateRandomString(32)
 	caller := r.URL.Query().Get("caller")
+	returnTo := r.URL.Query().Get("return_to")
 
 	h.statesMu.Lock()
 	// Prune old states
@@ -151,7 +153,7 @@ func (h *GoogleAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) 
 			delete(h.states, k)
 		}
 	}
-	h.states[state] = googleAuthState{CreatedAt: time.Now(), Caller: caller}
+	h.states[state] = googleAuthState{CreatedAt: time.Now(), Caller: caller, ReturnTo: returnTo}
 	h.statesMu.Unlock()
 
 	authURL, _ := url.Parse("https://accounts.google.com/o/oauth2/v2/auth")
@@ -311,6 +313,11 @@ func (h *GoogleAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Reques
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400 * 30, // 30 days
 	})
+
+	if st.ReturnTo != "" {
+		http.Redirect(w, r, st.ReturnTo, http.StatusFound)
+		return
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<!DOCTYPE html>
